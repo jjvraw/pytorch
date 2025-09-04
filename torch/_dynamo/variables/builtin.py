@@ -1820,6 +1820,8 @@ class BuiltinVariable(VariableTracker):
     def call_iter(self, tx: "InstructionTranslator", obj, *args, **kwargs):
         if isinstance(obj, variables.IteratorVariable):
             ret = obj
+        elif isinstance(obj, variables.RangeVariable):
+            ret = obj.call_method(tx, "__iter__", [], {})
         else:
             # Handle the case where we are iterating over a tuple, list or iterator
             ret = self._call_iter_tuple_list(tx, obj, *args, **kwargs)
@@ -2805,6 +2807,8 @@ class BuiltinVariable(VariableTracker):
                 UserDefinedObjectVariable,
             ),
         ):
+            # TODO(guilhermeleobas): forward the call to b.__ror__(a) if
+            # a.__ror__(b) returns NotImplemented
             return a.call_method(tx, "__or__", [b], {})
 
         # None no-ops this handler and lets the driving function proceed
