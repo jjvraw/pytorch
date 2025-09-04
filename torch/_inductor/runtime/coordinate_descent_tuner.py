@@ -43,7 +43,7 @@ def get_warpsmax():
     # CUDA/ROCm has a maximum of 1024 threads per block
     warp_size = (
         torch.cuda.get_device_properties().warp_size 
-        if torch.cuda.is_available() 
+        if torch.cuda.is_available()
         else 32
     )
     return 1024 // warp_size
