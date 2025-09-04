@@ -39,7 +39,7 @@ def set_field(config, name, value):
 
 
 @lru_cache(maxsize=1)
-def get_warpsmax(self):
+def get_warpsmax():
     # CUDA/ROCm has a maximum of 1024 threads per block
     warp_size = (
         torch.cuda.get_device_properties().warp_size 
