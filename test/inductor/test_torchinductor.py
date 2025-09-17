@@ -2998,7 +2998,7 @@ class CommonTemplate:
         x = torch.rand(10)
 
         with x.device:
-            out = torch.compile(fn)(x)
+            out = torch.compile(fn, backend=lambda gm, _: gm)(x)
             ref = fn(x)
             for a, b in zip(out, ref):
                 self.assertTrue(torch.allclose(a, b))
@@ -13934,6 +13934,116 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         inp = torch.randn(100, 100, device=self.device)
         self.assertTrue(CommonTemplate._is_triggering_buffer_reuse(fn, m, inp))
 
+    @requires_cuda_and_triton
+    def test_cpu_scalar_with_gpu_tensor(self):
+        def fn(a, b):
+            return a + b[0]
+
+        a = torch.rand(20, device=GPU_TYPE)
+        b = torch.rand(4, device="cpu")
+
+        torch._inductor.metrics.generated_kernel_count = 0
+        eager = fn(a, b)
+        compiled = torch.compile(fn, backend="inductor")(a, b)
+        self.assertEqual(eager, compiled)
+        self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
+
+    @requires_cuda_and_triton
+    @torch._inductor.config.patch(cpp_wrapper=True)
+    def test_cpu_scalar_with_gpu_tensor_cpp(self):
+        def fn(a, b):
+            return a + b[0]
+
+        a = torch.rand(20, device=GPU_TYPE)
+        b = torch.rand(4, device="cpu")
+
+        eager = fn(a, b)
+        compiled = torch.compile(fn, backend="inductor")(a, b)
+        self.assertEqual(eager, compiled)
+
+    @requires_cuda_and_triton
+    def test_cpu_scalar_with_gpu_tensor_dynamic(self):
+        def fn(a, b):
+            return a + b[0]
+
+        a = torch.rand(20, device=GPU_TYPE)
+        b = torch.rand(4, device="cpu")
+
+        eager = fn(a, b)
+        compiled = torch.compile(fn, backend="inductor", dynamic=True)(a, b)
+        self.assertEqual(eager, compiled)
+
+    def test_cpu_scalar_with_cpu_tensor(self):
+        def fn(a, b):
+            return a + b[0]
+
+        a = torch.rand(20, device="cpu")
+        b = torch.rand(4, device="cpu")
+
+        torch._inductor.metrics.generated_kernel_count = 0
+        eager = fn(a, b)
+        compiled = torch.compile(fn, backend="inductor")(a, b)
+        self.assertEqual(eager, compiled)
+        self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
+
+    @requires_cuda_and_triton
+    def test_gpu_scalar_with_gpu_tensor(self):
+        def fn(a, b):
+            return a + b[0]
+
+        a = torch.rand(20, device=GPU_TYPE)
+        b = torch.rand(4, device=GPU_TYPE)
+
+        torch._inductor.metrics.generated_kernel_count = 0
+        eager = fn(a, b)
+        compiled = torch.compile(fn, backend="inductor")(a, b)
+        self.assertEqual(eager, compiled)
+        self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
+
+    @requires_cuda_and_triton
+    def test_cpu_tensor_with_gpu_tensor(self):
+        def fn(a, b):
+            return a + b
+
+        a = torch.rand(20, device=GPU_TYPE)
+        b = torch.rand(20, device="cpu")
+
+        with self.assertRaises(RuntimeError):
+            compiled = torch.compile(fn, backend="inductor")(a, b)
+
+    def test_cpu_tensor_with_cpu_tensor(self):
+        def fn(a, b):
+            return a + b
+
+        a = torch.rand(20, device="cpu")
+        b = torch.rand(20, device="cpu")
+
+        eager = fn(a, b)
+        compiled = torch.compile(fn, backend="inductor")(a, b)
+        self.assertEqual(eager, compiled)
+
+    def test_cpu_scalar_with_cpu_scalar(self):
+        def fn(a, b):
+            return a[0] + b[0]
+
+        a = torch.rand(20, device="cpu")
+        b = torch.rand(20, device="cpu")
+
+        eager = fn(a, b)
+        compiled = torch.compile(fn, backend="inductor")(a, b)
+        self.assertEqual(eager, compiled)
+
+    @requires_cuda_and_triton
+    def test_gpu_scalar_with_cpu_tensor(self):
+        def fn(a, b):
+            return a[0] + b
+
+        a = torch.rand(20, device=GPU_TYPE)
+        b = torch.rand(20, device="cpu")
+
+        with self.assertRaises(RuntimeError):
+            compiled = torch.compile(fn, backend="inductor")(a, b)
+
     # end of class CommonTemplate - add new tests here
 
 
@@ -13985,7 +14095,7 @@ def add_test_failures(
     """
     In-place modifies the given dictionary of `test_failures` to add the
     contents of `added_test_failures` by unioning the test_failure.suffixes, and
-    or-ing the the is_skip value.
+    or-ing the is_skip value.
     """
     for name, new_failure in added_test_failures.items():
         if name in test_failures:
@@ -15386,6 +15496,43 @@ if RUN_GPU:
                 )
 
             fn()
+
+        @config.patch(implicit_fallbacks=True)
+        @torch._inductor.config.patch("graph_partition", True)
+        def test_graph_partition_default_device_context(self):
+            @torch.library.custom_op(
+                "mylib::cg_unsafe_op",
+                mutates_args=[],
+                schema="(Tensor x) -> Tensor",
+                device_types=GPU_TYPE,
+                tags=(torch._C.Tag.cudagraph_unsafe,),
+            )
+            def cg_unsafe_op(x) -> torch.Tensor:
+                return x + 1
+
+            @cg_unsafe_op.register_fake
+            def _(x) -> torch.Tensor:
+                return torch.empty_like(x)
+
+            def f(x):
+                x += 1
+                y = cg_unsafe_op(x)
+                y += 1
+                return y
+
+            f = torch.compile(f, mode="reduce-overhead")
+
+            inp = torch.randn(2, device=GPU_TYPE)
+            _, (code,) = run_and_get_code(f, inp)
+
+            if config.cpp_wrapper:
+                FileCheck().check_count(
+                    "AOTICudaGuard device_guard(0)", 1, exactly=True
+                ).run(code)
+            else:
+                FileCheck().check_count(
+                    "with torch.cuda._DeviceGuard(0)", 1, exactly=True
+                ).run(code)
 
     class RNNTest(TestCase):
         device_type = GPU_TYPE

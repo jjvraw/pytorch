@@ -218,12 +218,12 @@ class ShardingPropagator:
         else:
             return self._propagate_tensor_meta(op_schema)
 
-    def _wrap_output_spec_tensor_meta(
+    def _create_output_spec_with_new_tensor_meta(
         self,
         op: OpOverload,
         output_specs: OutputSpecType,
         output_tensor_meta: Union[None, TensorMeta, Sequence[Optional[TensorMeta]]],
-    ) -> None:
+    ) -> OutputSpecType:
         """
         Wrap the output_specs with the tensor metadata from the output.
         """
@@ -241,8 +241,9 @@ class ShardingPropagator:
                     "not equal the "
                     f"number of op outputs: {len(output_tensor_meta)}."
                 )
-            output_specs.tensor_meta = output_tensor_meta
+            return output_specs.shallow_copy_with_tensor_meta(output_tensor_meta)
         elif isinstance(output_specs, (tuple, list)):
+            new_specs: list[Optional[DTensorSpec]] = []
             if not isinstance(output_tensor_meta, (tuple, list)) or len(
                 output_specs
             ) != len(output_tensor_meta):
@@ -268,7 +269,7 @@ class ShardingPropagator:
                             and output_tensor_meta_i is None
                         ):
                             assert isinstance(output_specs, list)
-                            output_specs[i] = None
+                            new_specs.append(None)
                             continue
                         else:
                             raise ValueError(
@@ -276,7 +277,16 @@ class ShardingPropagator:
                                 "does not have an associated TensorMeta"
                             )
 
-                    spec.tensor_meta = output_tensor_meta_i
+                    new_specs.append(
+                        spec.shallow_copy_with_tensor_meta(output_tensor_meta_i)
+                    )
+                else:
+                    new_specs.append(spec)
+
+            return tuple(new_specs)
+        else:
+            assert output_specs is None
+            return output_specs
 
     def _wrap_with_op_strategy(self, op_schema: OpSchema) -> OpSchema:
         """
@@ -320,7 +330,7 @@ class ShardingPropagator:
         # because SymInts are not hashable.
         # This is generally ok because this only happens during tracing in torch.compile,
         # and tracing does not need to be as fast as eagermode DTensor usages.
-        if op_info.schema.has_symints:
+        if _are_we_tracing():
             output_sharding = self.propagate_op_sharding_non_cached(op_info.schema)
         else:
             output_sharding = cast(
@@ -338,7 +348,6 @@ class ShardingPropagator:
             return OutputSharding(None, op_schema)
 
         out_tensor_meta = self._propagate_tensor_meta_non_cached(op_schema)
-
         if op_schema.op in self.op_strategy_funcs:
             # wrap the op_schema with op strategy for sharding strategy propagation
             strategy_schema = self._wrap_with_op_strategy(op_schema)
@@ -504,9 +513,10 @@ class ShardingPropagator:
                 raise ValueError("Unsupported op strategy type")
 
             # associate the output sharding with the output tensor metadata
-            self._wrap_output_spec_tensor_meta(
+            new_output_spec = self._create_output_spec_with_new_tensor_meta(
                 op_schema.op, output_sharding.output_spec, out_tensor_meta
             )
+            output_sharding.output_spec = new_output_spec
             return output_sharding
         elif op_schema.op in self.op_to_rules:
             # propagate the sharding with rule
@@ -546,9 +556,10 @@ class ShardingPropagator:
                     output_sharding.needs_redistribute = True
 
             # associate the output sharding with the output tensor metadata
-            self._wrap_output_spec_tensor_meta(
+            new_output_spec = self._create_output_spec_with_new_tensor_meta(
                 op_schema.op, output_sharding.output_spec, out_tensor_meta
             )
+            output_sharding.output_spec = new_output_spec
 
             return output_sharding
         else:

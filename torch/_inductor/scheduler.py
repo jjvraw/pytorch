@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import dataclasses
 import functools
 import inspect
@@ -19,7 +20,7 @@ from typing_extensions import ParamSpec, TypeAlias
 
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
     from types import ModuleType
 
 import sympy
@@ -309,8 +310,8 @@ class BaseSchedulerNode:
 
     def reorder_loops_by_dep_pair(
         self, self_dep: MemoryDep, other_dep: MemoryDep
-    ) -> None:
-        return
+    ) -> bool:
+        return False
 
     def update_mutated_names(self, renames: dict[str, str]) -> None:
         self.mutation_renames = {
@@ -1130,6 +1131,11 @@ class NopKernelSchedulerNode(BaseSchedulerNode):
 
 
 class SchedulerNode(BaseSchedulerNode):
+    """
+    A SchedulerNode is a node for scheduling that encapsulates either
+    a ComputedBuffer or a TemplateBuffer.
+    """
+
     _sizes: tuple[Sequence[sympy.Expr], ...]
     _body: LoopBody
 
@@ -1254,7 +1260,7 @@ class SchedulerNode(BaseSchedulerNode):
 
     def reorder_loops_by_dep_pair(
         self, self_dep: MemoryDep, other_dep: MemoryDep
-    ) -> None:
+    ) -> bool:
         new_order = None
         self_sizes = self._sizes[0]
         if len(self_sizes) == self_dep.num_vars == other_dep.num_vars:
@@ -1266,11 +1272,13 @@ class SchedulerNode(BaseSchedulerNode):
                 "Reorder loops for %s with order %s", self.get_name(), new_order
             )
             self.apply_new_loop_order(new_order)
+            return True
         else:
             loop_ordering_log.debug(
                 "Don't reordering %s because we can not decide the suitable loop order",
                 self.get_name(),
             )
+            return False
 
     def debug_str_extra(self) -> str:
         name = self.get_name()
@@ -1527,10 +1535,13 @@ class FusedSchedulerNode(BaseSchedulerNode):
 
     def reorder_loops_by_dep_pair(
         self, self_dep: MemoryDep, other_dep: MemoryDep
-    ) -> None:
+    ) -> bool:
+        """
+        Return true if a loop reordering is performed.
+        """
         if self.is_template():
             # We can not really reorder loops for a triton template
-            return
+            return False
         self_sizes = None
         for snode in self.snodes:
             assert isinstance(snode, SchedulerNode)
@@ -1538,7 +1549,7 @@ class FusedSchedulerNode(BaseSchedulerNode):
                 loop_ordering_log.debug(
                     "Can not reorder fused node due to different sizes"
                 )
-                return
+                return False
             self_sizes = snode._sizes[0]
         new_order = None
 
@@ -1551,7 +1562,7 @@ class FusedSchedulerNode(BaseSchedulerNode):
                 "Dont reordering fused node %s because we can not decide the suitable loop order",
                 self.get_name(),
             )
-            return
+            return False
         metrics.num_loop_reordering += 1
         loop_ordering_log.debug(
             "Reorder loops for fused node %s with order %s", self.get_name(), new_order
@@ -1561,6 +1572,7 @@ class FusedSchedulerNode(BaseSchedulerNode):
             snode.apply_new_loop_order(new_order)
 
         refresh_group_node_dependencies(self)
+        return True
 
     def __init__(self, scheduler: Scheduler, snodes: list[BaseSchedulerNode]) -> None:
         super().__init__(scheduler)
@@ -2236,6 +2248,9 @@ class Scheduler:
         self.available_buffer_names.update(V.graph.constants.keys())
         for node in self.nodes:
             node.prune_deps()
+
+        # See [Note: Graph Partition Device Contexts]
+        self.default_device_context: Optional[torch.device] = None
 
         self.name_to_donated_buffer: dict[str, SchedulerDonatedBuffer] = (
             self.get_donated_buffers()
@@ -3796,14 +3811,6 @@ class Scheduler:
             return True
         return False
 
-    def fusion_accumulate_large_reads(
-        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode, threshold: int
-    ) -> bool:
-        all_reads = (node1.read_writes.reads | node2.read_writes.reads) - (
-            node1.read_writes.writes | node2.read_writes.writes
-        )
-        return sum(self.dep_size_hint(dep) for dep in all_reads) > threshold
-
     def are_long_distant_nodes(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
@@ -3900,6 +3907,11 @@ class Scheduler:
         Right now just greedily reorder the loop of node1 to be compatible with node2,
         but ideally we should have some heuristics to reorder the loop for node2
         to be compatible with node1 if that's more efficient.
+
+        Return the amount of shared data re-computed in this method.
+        If no such recomputation happens, return -1 (not return 0 since 0 is a valid
+        amount of shared data).
+
         """
 
         # TODO Don't do loop reordering for CPU for now.
@@ -3907,14 +3919,14 @@ class Scheduler:
         if not config.loop_ordering_after_fusion or any(
             n.is_cpu() for n in [node1, node2]
         ):
-            return 0
+            return -1
 
         node1_buffer_names = node1.read_writes.buffer_names()
         node2_buffer_names = node2.read_writes.buffer_names()
         # Fast path: no common buffers.
         common_buffer_names = node1_buffer_names & node2_buffer_names
         if not common_buffer_names:
-            return 0
+            return -1
 
         node1_name2dep = {dep.name: dep for dep in node1.read_writes.reads_and_writes()}
         node2_name2dep = {dep.name: dep for dep in node2.read_writes.reads_and_writes()}
@@ -3937,13 +3949,13 @@ class Scheduler:
                 )
 
         if len(candidates) == 0:
-            return 0
+            return -1
 
         # Pick the largest buffer to guide the loop reordering
         _numel, lhs_dep, rhs_dep = max(candidates, key=operator.itemgetter(0))
 
         if not isinstance(lhs_dep, MemoryDep) or not isinstance(rhs_dep, MemoryDep):
-            return 0
+            return -1
 
         if lhs_dep.num_vars != rhs_dep.num_vars:
             # this can happen due to we don't merge loops.
@@ -3952,13 +3964,14 @@ class Scheduler:
             # normalization (merging loops)
             if lhs_dep.normalize() == rhs_dep.normalize():
                 return self.dep_size_hint(lhs_dep)
-            return 0
+            return -1
 
+        reordered = False
         # Only reorder loops for pointwise for now
         if not node1.is_reduction():
-            node1.reorder_loops_by_dep_pair(lhs_dep, rhs_dep)
+            reordered = node1.reorder_loops_by_dep_pair(lhs_dep, rhs_dep)
         elif not node2.is_reduction():
-            node2.reorder_loops_by_dep_pair(rhs_dep, lhs_dep)
+            reordered = node2.reorder_loops_by_dep_pair(rhs_dep, lhs_dep)
         else:
             loop_ordering_log.debug(
                 "Don't reorder loops since both nodes are reductions: %s v.s. %s",
@@ -3966,7 +3979,7 @@ class Scheduler:
                 node2.get_name(),
             )
 
-        return self.score_fusion_memory(node1, node2)
+        return self.score_fusion_memory(node1, node2) if reordered else -1
 
     def unfusable_node(self, node: BaseSchedulerNode) -> bool:
         """
@@ -4255,7 +4268,9 @@ class Scheduler:
             shared_data_score < config.score_fusion_memory_threshold
             and config.loop_ordering_after_fusion
         ):
-            shared_data_score = self.shared_data_after_reordering_loop(node1, node2)
+            new_shared_data_score = self.shared_data_after_reordering_loop(node1, node2)
+            if new_shared_data_score >= 0:
+                shared_data_score = new_shared_data_score
 
         if config.expand_dimension_for_pointwise_nodes and (
             expand_analysis := self.get_expand_dim_for_pointwise_nodes(node1, node2)
@@ -5183,6 +5198,80 @@ class Scheduler:
             [node.get_name() for node in signature.output_nodes]
         )
 
+    def use_default_device_context(
+        self, partitions: list[PartitionType], signatures: list[GraphPartitionSignature]
+    ) -> contextlib.AbstractContextManager[None]:
+        @contextlib.contextmanager
+        def ctx() -> Iterator[None]:
+            self.update_graph_partition_default_device(partitions, signatures)
+            if self.default_device_context and device_need_guard(
+                self.default_device_context.type
+            ):
+                assert self.default_device_context.index is not None, (
+                    "device should have an index"
+                )
+                V.graph.wrapper_code.codegen_device_guard_enter(
+                    self.default_device_context.index
+                )
+
+            try:
+                yield
+            finally:
+                if self.default_device_context and device_need_guard(
+                    self.default_device_context.type
+                ):
+                    V.graph.wrapper_code.codegen_device_guard_exit()
+                self.default_device_context = None
+
+        return ctx()
+
+    def update_graph_partition_default_device(
+        self, partitions: list[PartitionType], signatures: list[GraphPartitionSignature]
+    ) -> None:
+        # Note: [Graph Partition Device Contexts]
+        # Entering a device context takes 60 microseconds and exiting a device
+        # context takes 20 microseconds. If all graph partitions and
+        # cudagraph-unsafe ops happen on the same device, we can share the
+        # device context.
+
+        if len(partitions) == 1 and not signatures[0].skip_cudagraph:
+            # If there is only 1 cudagraph partition, the device context
+            # should happen within the cudagraph partition, which
+            # would be removed by cudagraph.
+            return
+
+        def get_cudagraph_partition_device(partition: PartitionType) -> torch.device:
+            partition_device = partition[0].get_device()
+            assert partition_device is not None
+            return partition_device
+
+        def all_on_target_device(
+            partition: PartitionType, target_device: torch.device
+        ) -> bool:
+            for node in partition:
+                device = node.get_device()
+                if device != target_device:
+                    return False
+            return True
+
+        cudagraph_partition_device = None
+        for partition, signature in zip(partitions, signatures):
+            if not signature.skip_cudagraph:
+                cudagraph_partition_device = get_cudagraph_partition_device(partition)
+                break
+
+        # all partitions skip cudagraph
+        if cudagraph_partition_device is None:
+            return
+
+        for partition, signature in zip(partitions, signatures):
+            if signature.skip_cudagraph and not all_on_target_device(
+                partition, cudagraph_partition_device
+            ):
+                return
+
+        self.default_device_context = cudagraph_partition_device
+
     def _codegen_partitions(self) -> None:
         """
         Split nodes into partitions and codegen each partition into separate functions.
@@ -5195,15 +5284,16 @@ class Scheduler:
             msg = f"cudagraph partition into {len(partitions)} partitions"
             maybe_log_cudagraph_partition(msg=msg, prefix="")
 
-        for partition, signature in zip(partitions, signatures):
-            assert len(partition) >= 1, (
-                f"Each partition must have at least one node but found {len(partition)}"
-            )
+        with self.use_default_device_context(partitions, signatures):
+            for partition, signature in zip(partitions, signatures):
+                assert len(partition) >= 1, (
+                    f"Each partition must have at least one node but found {len(partition)}"
+                )
 
-            if signature.skip_cudagraph:
-                self._codegen(partition)
-            else:
-                self._codegen_partition_wrapper(partition, signature)
+                if signature.skip_cudagraph:
+                    self._codegen(partition)
+                else:
+                    self._codegen_partition_wrapper(partition, signature)
 
         num_partitions = next(self._graph_partition_counter)
         V.graph.wrapper_code.set_all_partition_names(num_partitions)
@@ -5236,7 +5326,11 @@ class Scheduler:
                 )
                 seen.add(key)
 
-        self.current_device = None
+        self.current_device = self.default_device_context
+
+        if self.default_device_context and config.triton.autotune_at_compile_time:
+            V.graph.wrapper_code.write_get_raw_stream_header()
+
         for node in nodes:
             if log.isEnabledFor(logging.DEBUG):
                 try:
@@ -5315,10 +5409,15 @@ class Scheduler:
                 ):
                     self.flush()
 
-        if self.current_device and device_need_guard(self.current_device.type):
-            # exit the outermost CUDA device guard. this is
-            # important for nested indentation codegen-ing.
-            V.graph.wrapper_code.codegen_device_guard_exit()
+        if self.current_device != self.default_device_context:
+            # when default_device_context is not None, we are codegen
+            # for graph partitions and all nodes must be on
+            # the same default device.
+            assert self.current_device is not None
+            if device_need_guard(self.current_device.type):
+                # exit the outermost CUDA device guard. this is
+                # important for nested indentation codegen-ing.
+                V.graph.wrapper_code.codegen_device_guard_exit()
 
         self.flush()
 
