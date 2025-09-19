@@ -2505,7 +2505,6 @@ end
             generated_files.append(kernel_info_json)
 
         if config.aot_inductor.package:
-
             # We want to return the directory that contains all the AOTI
             # generated files, not just the so
             # return os.path.split(output_so)[0]
