@@ -1079,7 +1079,7 @@ def single_batch_reference_fn(input, parameters, module):
 
 
 def get_new_module_tests():
-    assert common_utils.SEED is not None, "Make sure the seed is set before calling get_new_module_tests()"
+    common_utils.set_rng_seed()
     new_module_tests = [
         poissonnllloss_no_reduce_test(),
         bceloss_no_reduce_test(),

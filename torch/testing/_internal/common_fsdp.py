@@ -1183,7 +1183,7 @@ class FSDPTest(MultiProcessTestCase):
         return run_subtests(self, *args, **kwargs)
 
     @classmethod
-    def _run(cls, rank, test_name, file_name, pipe, seed, **kwargs):  # type: ignore[override]
+    def _run(cls, rank, test_name, file_name, pipe, **kwargs):  # type: ignore[override]
         self = cls(test_name)
         self.rank = rank
         self.file_name = file_name
@@ -1229,7 +1229,7 @@ class FSDPTest(MultiProcessTestCase):
         dist.barrier(device_ids=device_ids)
 
         torch._dynamo.reset()
-        set_rng_seed(seed)
+        set_rng_seed()
         self.run_test(test_name, pipe)
         torch._dynamo.reset()
 

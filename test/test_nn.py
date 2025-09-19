@@ -62,7 +62,6 @@ AMPERE_OR_ROCM = TEST_WITH_ROCM or torch.cuda.is_tf32_supported()
 
 if TEST_WITH_ROCM:
     os.environ["PYTORCH_MIOPEN_SUGGEST_NHWC"] = "1"
-    os.environ["PYTORCH_MIOPEN_SUGGEST_NHWC_BATCHNORM"] = "1"
 
 # load_tests from common_utils is used to automatically filter tests for
 # sharding on sandcastle. This line silences flake warnings
@@ -3515,6 +3514,7 @@ tensor(..., device='meta', size=(1,), requires_grad=True)""")
             self.assertRaisesRegex(RuntimeError, re.escape("input.size(-1) must be equal to input_size"), rnn, x_wrong)
 
     @unittest.skipIf(not TEST_CUDNN, 'CUDNN not available')
+    @skipIfRocm
     def test_cudnn_weight_format(self):
         rnns = [
             nn.LSTM(10, 20, batch_first=True),
@@ -3522,8 +3522,7 @@ tensor(..., device='meta', size=(1,), requires_grad=True)""")
             nn.GRU(10, 20, batch_first=True),
             nn.RNN(10, 20, batch_first=True)
         ]
-        # ROCm RNN does not issue warning about single contig chunk of memory, so don't assert it
-        first_warn = False if torch.version.hip else True
+        first_warn = True
         for rnn in rnns:
             rnn.cuda()
             input = torch.randn(5, 4, 10, requires_grad=True, device="cuda")
@@ -5172,38 +5171,24 @@ tensor(..., device='meta', size=(1,), requires_grad=True)""")
             ("NCHW", "native", False, torch.float),
             ("NCHW", "native", True, torch.half),
             ("NCHW", "native", True, torch.bfloat16),
-
-            ("NHWC", "cpu", False, torch.float),
-            ("NHWC", "cpu", True, torch.half),
-            ("NHWC", "cpu", True, torch.bfloat16),
-
-            ("NHWC", "native", False, torch.float),
-            ("NHWC", "native", True, torch.half),
-            ("NHWC", "native", True, torch.bfloat16),
-
-            ("NHWC", "NCHW", False, torch.float),
-            ("NHWC", "NCHW", True, torch.half),
-            ("NHWC", "NCHW", True, torch.bfloat16),
         ],
         name_fn=lambda f, b, m, t: f"{f}_vs_{b}{'_mixed' if m else ''}_{dtype_name(t)}"
     )
     def test_batchnorm(self, dims, mode, memory_format, ref_backend, mixed, dtype):
         if torch.version.cuda:
             if self._testMethodName in ("test_batchnorm_2D_train_NCHW_vs_cpu_mixed_bfloat16",
-                                        "test_batchnorm_3D_train_NCHW_vs_cpu_mixed_bfloat16",
-                                        "test_batchnorm_2D_train_NHWC_vs_NCHW_mixed_bfloat16",
-                                        "test_batchnorm_3D_train_NHWC_vs_NCHW_mixed_bfloat16",
-                                        "test_batchnorm_3D_train_NCHW_vs_native_mixed_float16"):
-                self.skipTest("Failed on CUDA")
+                                        "test_batchnorm_3D_train_NCHW_vs_cpu_mixed_bfloat16"):
+                self.skipTest("bfloat16 NHWC train failed on CUDA due to native tolerance issue "
+                              "https://github.com/pytorch/pytorch/issues/156513")
+            if self._testMethodName == "test_batchnorm_3D_train_NCHW_vs_native_mixed_float16":
+                self.skipTest("Batchnorm 3D NHWC train failed on CUDA")
 
         if torch.version.hip:
             if self._testMethodName in ("test_batchnorm_2D_train_NCHW_vs_cpu_mixed_bfloat16",
-                                        "test_batchnorm_3D_train_NCHW_vs_cpu_mixed_bfloat16",
-                                        "test_batchnorm_2D_train_NHWC_vs_NCHW_mixed_bfloat16",
-                                        "test_batchnorm_3D_train_NHWC_vs_NCHW_mixed_bfloat16") \
+                                        "test_batchnorm_3D_train_NCHW_vs_cpu_mixed_bfloat16") \
                     and _get_torch_rocm_version() < (6, 4):
                 # NCHW bfloat16 path uses native kernels for rocm<=6.3
-                # train failed on rocm<=6.3 due to native accuracy issue
+                # train failed on rocm<=6.3 due to native tolerance issue
                 # https://github.com/pytorch/pytorch/issues/156513
                 self.skipTest("bfloat16 NHWC train failed on ROCm <= 6.3")
 
@@ -5213,8 +5198,9 @@ tensor(..., device='meta', size=(1,), requires_grad=True)""")
                 # https://github.com/pytorch/pytorch/issues/156513
                 self.skipTest("bfloat16 NCHW train failed due to native tolerance issue")
 
-            if self._testMethodName == "test_batchnorm_3D_train_NCHW_vs_native_mixed_float16":
-                self.skipTest("3D float16 NCHW train failed on ROCm")
+            if self._testMethodName == "test_batchnorm_3D_train_NCHW_vs_native_mixed_float16" \
+                    and _get_torch_rocm_version() < (7, 0):
+                self.skipTest("3D float16 NCHW train failed on ROCm<7.0")
 
         if dims == 3 and memory_format in ("NHWC", "NCHW"):
             memory_format = memory_format + "3D"
@@ -7661,13 +7647,6 @@ def add_test(test, decorator=None):
             add(cuda_test_name + '_tf32', with_tf32_on)
         else:
             add(cuda_test_name, with_tf32_off)
-
-if __name__ == '__main__':
-    from torch.testing._internal.common_utils import parse_cmd_line_args
-
-    # The value of the SEED depends on command line arguments so make sure they're parsed
-    # before instantiating tests because some modules as part of get_new_module_tests() will call torch.randn
-    parse_cmd_line_args()
 
 for test_params in module_tests + get_new_module_tests():
     # TODO: CUDA is not implemented yet

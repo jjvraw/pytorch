@@ -101,6 +101,7 @@ except ImportError:
     has_pytest = False
 
 
+SEED = 1234
 MI300_ARCH = ("gfx942",)
 MI200_ARCH = ("gfx90a")
 
@@ -120,7 +121,6 @@ PYTEST_SINGLE_TEST = ""
 REPEAT_COUNT = 0
 RERUN_DISABLED_TESTS = False
 RUN_PARALLEL = 0
-SEED : Optional[int] = None
 SHOWLOCALS = False
 SLOW_TESTS_FILE = ""
 TEST_BAILOUTS = False
@@ -958,7 +958,6 @@ def parse_cmd_line_args():
     global REPEAT_COUNT
     global RERUN_DISABLED_TESTS
     global RUN_PARALLEL
-    global SEED
     global SHOWLOCALS
     global SLOW_TESTS_FILE
     global TEST_BAILOUTS
@@ -972,7 +971,6 @@ def parse_cmd_line_args():
     parser = argparse.ArgumentParser(add_help=not is_running_via_run_test, allow_abbrev=False)
     parser.add_argument('--subprocess', action='store_true',
                         help='whether to run each test in a subprocess')
-    parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--accept', action='store_true')
     parser.add_argument('--jit-executor', '--jit_executor', type=str)
     parser.add_argument('--repeat', type=int, default=1)
@@ -1023,12 +1021,12 @@ def parse_cmd_line_args():
     TEST_IN_SUBPROCESS = args.subprocess
     TEST_SAVE_XML = args.save_xml
     REPEAT_COUNT = args.repeat
-    SEED = args.seed
     SHOWLOCALS = args.showlocals
     if not getattr(expecttest, "ACCEPT", False):
         expecttest.ACCEPT = args.accept
     UNITTEST_ARGS = [sys.argv[0]] + remaining
-    torch.manual_seed(SEED)
+
+    set_rng_seed()
 
 # CI Prefix path used only on CI environment
     CI_TEST_PREFIX = str(Path(os.getcwd()))
@@ -2438,17 +2436,7 @@ def get_function_arglist(func):
 
 def set_rng_seed(seed=None):
     if seed is None:
-        if SEED is not None:
-            seed = SEED
-        else:
-            # Can't assert here: this function is called by TestCase.setUp() and some out of tree tests inherit from that class.
-            # So just print a warning and hardcode the seed.
-            seed = 1234
-            msg = ("set_rng_seed() was called without providing a seed and the command line "
-                   f"arguments haven't been parsed so the seed will be set to {seed}. "
-                   "To remove this warning make sure your test is run via run_tests() or "
-                   "parse_cmd_line_args() is called before set_rng_seed() is called.")
-            warnings.warn(msg)
+        seed = SEED
     torch.manual_seed(seed)
     random.seed(seed)
     if TEST_NUMPY:
