@@ -3,6 +3,7 @@
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <ATen/native/Resize.h>
 #include <ATen/native/mkldnn/xpu/detail/oneDNN.h>
+#include <ATen/native/xpu/Blas.h>
 #include <torch/library.h>
 #ifndef AT_PER_OPERATOR_HEADERS
 
@@ -53,14 +54,7 @@ Tensor& addmm_out(
       mat2.dtype())
   // complex case
   if (self.is_complex()) {
-    static auto op = c10::Dispatcher::singleton().findSchemaOrThrow(
-        "aten::_addmm_mkl", "out");
-    static auto op_typed = op.typed<decltype(addmm_out)>();
-
-    TORCH_CHECK(
-        op.hasKernelForDispatchKey(c10::DispatchKey::XPU),
-        "Complex datatype matmul is not supported in oneDNN");
-    op_typed.call(self, mat1, mat2, beta, alpha, result);
+    at::native::addmm_complex_out_xpu(self, mat1, mat2, beta, alpha, result);
 
     return result;
   }
@@ -179,14 +173,7 @@ Tensor& mm_out(const Tensor& self, const Tensor& mat2, Tensor& result) {
   }
 
   if (self.is_complex()) {
-    static auto op =
-        c10::Dispatcher::singleton().findSchemaOrThrow("aten::_mm_mkl", "out");
-    static auto op_typed = op.typed<decltype(mm_out)>();
-
-    TORCH_CHECK(
-        op.hasKernelForDispatchKey(c10::DispatchKey::XPU),
-        "Complex datatype matmul is not supported in oneDNN");
-    op_typed.call(self, mat2, result);
+    at::native::mm_complex_out_xpu(self, mat2, result);
 
     return result;
   }
@@ -230,14 +217,8 @@ Tensor& baddbmm_out(
 
   // complex case
   if (input.is_complex()) {
-    static auto op = c10::Dispatcher::singleton().findSchemaOrThrow(
-        "aten::_baddbmm_mkl", "out");
-    static auto op_typed = op.typed<decltype(baddbmm_out)>();
-
-    TORCH_CHECK(
-        op.hasKernelForDispatchKey(c10::DispatchKey::XPU),
-        "Complex datatype matmul is not supported in oneDNN");
-    op_typed.call(input, batch1, batch2, beta, alpha, result);
+    at::native::baddbmm_complex_out_xpu(
+        input, batch1, batch2, beta, alpha, result);
 
     return result;
   }
@@ -289,14 +270,7 @@ Tensor& bmm_out(const Tensor& self, const Tensor& batch2, Tensor& result) {
 
   // complex case
   if (self.is_complex()) {
-    static auto op =
-        c10::Dispatcher::singleton().findSchemaOrThrow("aten::_bmm_mkl", "out");
-    static auto op_typed = op.typed<decltype(bmm_out)>();
-
-    TORCH_CHECK(
-        op.hasKernelForDispatchKey(c10::DispatchKey::XPU),
-        "Complex datatype matmul is not supported in oneDNN");
-    op_typed.call(self, batch2, result);
+    at::native::bmm_complex_out_xpu(self, batch2, result);
 
     return result;
   }
