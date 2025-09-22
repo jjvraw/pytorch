@@ -23,6 +23,7 @@
 #include <ATen/ops/linspace.h>
 #endif
 
+#include <cmath>
 #include <numeric>
 #include <tuple>
 #include <vector>
@@ -202,6 +203,41 @@ select_outer_bin_edges(const Tensor& input, std::optional<c10::ArrayRef<double>>
     return std::make_pair(leftmost_edges, rightmost_edges);
 }
 
+
+/* Bin edges correction based on the precision representation.
+ * To maintain the backward compatibility we take max(std::nextafter<>, +1)
+ * and min(std::nextafter<>, -1) for scalar types. For other types +/- 1 as usual.
+ */
+void bins_edges_correction(const ScalarType& t, double &leftmost_edge, double &rightmost_edge)
+{
+#define UPDATE_WITH_LIMIT(real_type, scalartype) \
+  case ScalarType::scalartype:                   \
+    leftmost_edge = std::min(                    \
+        std::nextafter(                          \
+            leftmost_edge,                       \
+            static_cast<double>(std::numeric_limits<real_type>::lowest()) \
+        ),                                       \
+        leftmost_edge - 1                        \
+    );                                           \
+    rightmost_edge = std::max(                   \
+        std::nextafter(                          \
+            rightmost_edge,                      \
+            static_cast<double>(std::numeric_limits<real_type>::max()) \
+        ),                                       \
+        rightmost_edge + 1                       \
+    );                                           \
+    break;
+
+    switch (t) {
+        AT_FORALL_SCALAR_TYPES(UPDATE_WITH_LIMIT)
+        default:
+            // Fallback to the default behavior for other types
+            leftmost_edge -= 1;
+            rightmost_edge += 1;
+    }
+#undef UPDATE_WITH_LIMIT
+}
+
 /* histc's version of the logic for outermost bin edges.
  */
 std::pair<double, double> histc_select_outer_bin_edges(const Tensor& input,
@@ -216,8 +252,7 @@ std::pair<double, double> histc_select_outer_bin_edges(const Tensor& input,
     }
 
     if (leftmost_edge == rightmost_edge) {
-        leftmost_edge -= 1;
-        rightmost_edge += 1;
+        bins_edges_correction(input.dtype().toScalarType(), leftmost_edge, rightmost_edge);
     }
 
     TORCH_CHECK(!(std::isinf(leftmost_edge) || std::isinf(rightmost_edge) ||

@@ -3047,8 +3047,12 @@ class TestReductions(TestCase):
             torch.tensor([1], dtype=torch.float, device=device),
             actual)
         # tensors with inf; min, max not provided -- should throw a RuntimeError
-        with self.assertRaisesRegex(RuntimeError, r'range of \[inf, inf\] is not finite'):
+        with self.assertRaisesRegex(RuntimeError, r'range of \[(?:-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?|inf), inf\] is not finite'):
             torch.histc(torch.tensor([float("inf")], dtype=torch.float, device=device))
+        with self.assertRaisesRegex(RuntimeError, r'range of \[-inf, (?:-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?|-inf)\] is not finite'):
+            torch.histc(torch.tensor([float("-inf")], dtype=torch.float, device=device))
+        with self.assertRaisesRegex(RuntimeError, r'range of \[-inf, inf\] is not finite'):
+            torch.histc(torch.tensor([float("-inf"), float("inf")], dtype=torch.float, device=device))
         with self.assertRaisesRegex(RuntimeError, r'range of \[1, inf\] is not finite'):
             torch.histc(torch.tensor([1., 2., float("inf")], dtype=torch.float, device=device))
         # tensors with inf; min, max provided
