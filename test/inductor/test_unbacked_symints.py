@@ -607,6 +607,30 @@ class TestUnbackedSymints(InductorTestCase):
         expected = fn(*example_inputs)
         torch.testing.assert_close(actual, expected)
 
+    @skipGPUIf(not HAS_GPU, "requires gpu and triton")
+    @inductor_config.patch({"max_autotune": True})
+    @dynamo_config.patch({"capture_scalar_outputs": True})
+    def test_autotune_with_unbacked_stride(self, device):
+        if device == "cpu":
+            raise unittest.SkipTest("Only testing on GPU")
+
+        def fn(x, y, a):
+            u0 = a.item()
+            # stride - [128 * u0, 128, 1]
+            unbacked = x.expand(8, u0, *x.shape).clone()
+            y = y.expand(8, *y.shape).clone()
+            bmm = torch.ops.aten.bmm(unbacked, y)
+            return bmm
+
+        example_inputs = (
+            torch.randn((128,), dtype=torch.bfloat16, device=device),
+            torch.randn((128, 128), dtype=torch.bfloat16, device=device),
+            torch.tensor(8192, device=device),
+        )
+        actual = torch.compile(fn, fullgraph=True)(*example_inputs)
+        expected = fn(*example_inputs)
+        torch.testing.assert_close(actual, expected)
+
 
 instantiate_device_type_tests(TestUnbackedSymints, globals(), allow_xpu=True)
 
