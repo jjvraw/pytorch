@@ -905,10 +905,6 @@ class FxConverter:
         call_args = self._lookup_args(line.call_args)
         kernel = self.kernels[line.kernel_name]
         tuner = kernel.tuner
-        # Use python_slow mode instead of python mode to avoid
-        # the round to neginf behaviour, which is not the convention
-        # in other languages.
-        tuner.grid_mode = "python_slow"
 
         # Optionally autotune the kernels.
         # The FX backend currently only supports compile-time tuning.
