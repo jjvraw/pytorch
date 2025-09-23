@@ -389,7 +389,8 @@ def standalone_compile(
         "from_example_inputs", "from_tracing_context", "from_graph"
     ] = "from_graph",
     options: Optional[dict[str, Any]] = None,
-) -> CompiledArtifact:
+    save_artifacts: bool = True,
+) -> CompiledArtifact | Callable[..., Any]:
     """
     Precompilation API for inductor.
 
@@ -412,6 +413,8 @@ def standalone_compile(
             If "from_example_inputs", we will specialize the graph on the
             example_inputs.
         options: Inductor compilation options
+        save_artifacts: If False, return the callable directly without saving
+            artifacts. Default is True.
 
     Returns:
         CompiledArtifact that can be saved to disk or invoked directly.
@@ -420,5 +423,9 @@ def standalone_compile(
 
     options = options if options else {}
     return standalone_compile(
-        gm, example_inputs, dynamic_shapes=dynamic_shapes, options=options
+        gm,
+        example_inputs,
+        dynamic_shapes=dynamic_shapes,
+        options=options,
+        save_artifacts=save_artifacts,
     )

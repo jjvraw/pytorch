@@ -668,6 +668,7 @@ class CachingAutotuner(KernelInterface):
                 result.kernel.cubin_raw = None
 
     def __getstate__(self) -> dict[str, Any]:
+        self.prepare_for_pickle()
         assert not self.launchers, (
             "pickle should not be called with after make_launchers()"
         )
