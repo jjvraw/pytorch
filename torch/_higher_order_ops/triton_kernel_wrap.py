@@ -14,6 +14,7 @@ from typing_extensions import Never
 
 import sympy
 
+from torch._dynamo.variables import constant
 import torch.fx as fx
 import torch.utils._pytree as pytree
 from torch import SymInt, Tensor
@@ -148,6 +149,7 @@ class KernelSideTable:
     id_to_kernel: dict[int, "TritonKernelType"] = {}
     kernel_to_id: dict["TritonKernelType", int] = {}
     constant_args: dict[int, dict[str, Any]] = {}
+    fusion_metadata: dict[int, dict[str, Any]] = {}
     lock = threading.Lock()
 
     # Returns index on the table
@@ -175,11 +177,18 @@ class KernelSideTable:
             self.constant_args[idx] = args
             return idx
 
+    def set_fusion_metadata(self, idx: int, extras: dict[str, Any]) -> None:  # <— NEW
+        with self.lock:
+            self.fusion_metadata[idx] = dict(extras)
+
     # Returns the constant args
     def get_constant_args(self, idx: int) -> dict[str, Any]:
         # No need to lock here as fetching from dict is atomic
         assert idx in self.constant_args
         return self.constant_args[idx]
+
+    def get_fusion_metadata(self, idx: int) -> dict[str, Any]:
+        return self.fusion_metadata.get(idx, {})
 
     # Resets the table (only meant to be used in unit tests)
     # This is only safe assuming single threaded execution
@@ -187,6 +196,7 @@ class KernelSideTable:
         self.id_to_kernel = {}
         self.kernel_to_id = {}
         self.constant_args = {}
+        self.fusion_metadata = {}
 
 
 kernel_side_table = KernelSideTable()
@@ -1570,6 +1580,7 @@ class TritonHOPifier:
             kernel=variable.kernel,
             kernel_idx=variable.kernel_idx,
             grid=args[0],
+            attempt_fusion=variable.attempt_fusion,
         )
 
     def call_run(
@@ -1586,7 +1597,10 @@ class TritonHOPifier:
         # rewrite kernel.run(*args, grid=grid) to kernel[grid](*args)
         return self.call_triton_kernel(
             type(variable)(
-                kernel=variable.kernel, kernel_idx=variable.kernel_idx, grid=grid
+                kernel=variable.kernel,
+                kernel_idx=variable.kernel_idx,
+                grid=grid,
+                attempt_fusion=getattr(variable, "attempt_fusion", False),
             ),
             args,
             kwargs,
@@ -1687,7 +1701,12 @@ class TritonHOPifier:
             )(iter_kernel)
             # create a new variable to contain the new (wrapped) kernel;
             # skip kernel_idx to get a new record in the kernel side table
-            new_var = type(variable)(new_kernel, None, variable.grid)
+            new_var = type(variable)(
+                new_kernel,
+                None,
+                variable.grid,
+                attempt_fusion=getattr(variable, "attempt_fusion", False),
+            )
             return self.call_triton_kernel(new_var, args, kwargs, tx)
 
         SPECIAL_CONFIG_NAMES = {
@@ -1731,7 +1750,12 @@ class TritonHOPifier:
 
             # create a new variable to contain the new (wrapped) kernel;
             # skip kernel_idx to get a new record in the kernel side table
-            new_var = type(variable)(new_kernel, None, variable.grid)
+            new_var = type(variable)(
+                new_kernel,
+                None,
+                variable.grid,
+                attempt_fusion=getattr(variable, "attempt_fusion", False),
+            )
             return self.call_triton_kernel(new_var, args, kwargs, tx)
 
         if isinstance(variable.kernel, Autotuner):
@@ -1753,9 +1777,9 @@ class TritonHOPifier:
                 for config in new_configs:
                     for name in special_param_names:
                         if name not in config.__dict__["kwargs"]:
-                            assert name in config.__dict__, (
-                                f"{name} must be in autotuning configs to be used as a kernel parameter"
-                            )
+                            assert (
+                                name in config.__dict__
+                            ), f"{name} must be in autotuning configs to be used as a kernel parameter"
                             config.__dict__["kwargs"][name] = config.__dict__[name]
                             updated = True
 
@@ -1769,7 +1793,12 @@ class TritonHOPifier:
                     new_kernel = autotune(
                         configs=new_configs, prune_configs_by=prune_configs_by, key=[]
                     )(variable.kernel.fn)
-                    new_var = type(variable)(new_kernel, None, variable.grid)
+                    new_var = type(variable)(
+                        new_kernel,
+                        None,
+                        variable.grid,
+                        attempt_fusion=getattr(variable, "attempt_fusion", False),
+                    )
                     return self.call_triton_kernel(new_var, args, kwargs, tx)
 
         # These are the default values in upstream Triton
@@ -1829,7 +1858,12 @@ class TritonHOPifier:
             new_kernel = autotune(configs=pruned_configs, key=[])(variable.kernel.fn)
             # create a new variable to contain the new (wrapped) kernel;
             # skip kernel_idx to get a new record in the kernel side table
-            new_var = type(variable)(new_kernel, None, variable.grid)
+            new_var = type(variable)(
+                new_kernel,
+                None,
+                variable.grid,
+                attempt_fusion=getattr(variable, "attempt_fusion", False),
+            )
             return self.call_triton_kernel(new_var, args, kwargs, tx)
 
         # Both for grid's meta as well as for the kernel, we need combined
@@ -1985,6 +2019,8 @@ class TracingTritonHOPifier(TritonHOPifier):
 
         constant_args_idx = kernel_side_table.add_constant_args(non_graphable_args)
 
+        print("Stop you coming and come", kernel_side_table.fusion_metadata)
+
         return graphable_args, constant_args_idx
 
     def call_HOP(
@@ -1996,8 +2032,13 @@ class TracingTritonHOPifier(TritonHOPifier):
     ) -> None:
         assert tx is None
         assert isinstance(variable, TraceableTritonKernelWrapper)
-
-        graphable_args, constant_args_idx = self.store_non_graphable_args(combined_args)
+        graphable_args, constant_args_idx = self.store_non_graphable_args(
+            combined_args,
+        )
+        kernel_side_table.set_fusion_metadata(
+            variable.kernel_idx,
+            {"attempt_fusion": bool(getattr(variable, "attempt_fusion", False))},
+        )
 
         assert isinstance(variable.kernel_idx, int)
         return triton_kernel_wrapper_mutation(
@@ -2024,9 +2065,12 @@ class TraceableTritonKernelWrapper:
         kernel: "TritonKernelType",
         kernel_idx: Optional[int],
         grid: Optional["TritonGridType"],
+        attempt_fusion: bool = False,
     ) -> None:
         self.kernel = None
         self.grid = None
+        self.attempt_fusion = attempt_fusion
+        print("Inside TTW", attempt_fusion)
         tracing_triton_hopifier_singleton.init_variable(self, kernel, kernel_idx, grid)
         assert self.kernel is not None
 

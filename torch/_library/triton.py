@@ -10,6 +10,24 @@ from torch.utils._exposed_in import exposed_in
 from .custom_ops import custom_op, CustomOpDef
 from .infer_schema import infer_schema
 
+import contextvars
+from contextlib import contextmanager
+
+_fusion_meta = threading.local()
+_fusion_meta.attempt_fusion = False  # Set default
+
+@contextmanager
+def fusion_meta(attempt_fusion: bool) -> Generator[None, None, None]:
+    prior = getattr(_fusion_meta, "attempt_fusion", False)
+    _fusion_meta.attempt_fusion = bool(attempt_fusion)
+    try:
+        yield
+    finally:
+        _fusion_meta.attempt_fusion = prior
+
+def current_fusion_meta() -> bool:
+    return getattr(_fusion_meta, "attempt_fusion", False)
+
 
 triton_ops_to_kernels: dict[str, list[object]] = {}
 
@@ -92,6 +110,7 @@ def triton_op(
     *,
     mutates_args: Union[str, Iterable[str]],
     schema: Optional[str] = None,
+    attempt_fusion: bool = False,
 ) -> Callable:
     """Create a custom operator whose implementation is backed by 1+ triton kernels.
 
@@ -199,7 +218,12 @@ def triton_op(
 
         # We require that the user pass us a function that is make_fx traceable,
         # so we can just register it as the Fake/meta kernel.
-        result.register_fake(fn)
+        def _fake_wrapper(*a, **k):
+            # ensure the very first meta/fake run has the same default
+            with fusion_meta(attempt_fusion=attempt_fusion):
+                return fn(*a, **k)
+
+        result.register_fake(_fake_wrapper)
 
         # We decompose the operator when FunctionalTensorMode is active.
         # The goal is to decompose the operator in AOTDispatcher.
@@ -247,11 +271,12 @@ def triton_op(
 
                 if unrecognized_types:
                     return NotImplemented
-                with mode:
+                with mode, fusion_meta(attempt_fusion=attempt_fusion):
                     return fn(*args, **kwargs)
 
         triton_kernels = get_inner_triton_kernels(fn)
         triton_ops_to_kernels[name] = triton_kernels
+        print("inside triton_op", triton_ops_to_kernels)
         result.register_torch_dispatch(FunctionalTensorMode, functional_decomp)
         return result
 
@@ -292,7 +317,9 @@ def capture_triton(triton_kernel: Callable, /) -> Any:
 
 
 @exposed_in("torch.library")
-def wrap_triton(triton_kernel: Callable, /) -> Any:
+def wrap_triton(
+    triton_kernel: Callable, attempt_fusion: Optional[bool] = None, /
+) -> Any:
     """Allows capture of a triton kernel into a graph via make_fx or
     non-strict ``torch.export``.
 
@@ -365,4 +392,11 @@ def wrap_triton(triton_kernel: Callable, /) -> Any:
         )
     if not is_wrap_triton_enabled():
         return triton_kernel
-    return TraceableTritonKernelWrapper(triton_kernel, None, None)
+
+    if attempt_fusion is None:
+        attempt_fusion = bool(current_fusion_meta())
+    print("DONT SHOOT", attempt_fusion)
+
+    return TraceableTritonKernelWrapper(
+        triton_kernel, None, None, attempt_fusion=attempt_fusion
+    )
