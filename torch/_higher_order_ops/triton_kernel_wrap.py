@@ -14,7 +14,6 @@ from typing_extensions import Never
 
 import sympy
 
-from torch._dynamo.variables import constant
 import torch.fx as fx
 import torch.utils._pytree as pytree
 from torch import SymInt, Tensor
@@ -177,9 +176,9 @@ class KernelSideTable:
             self.constant_args[idx] = args
             return idx
 
-    def set_fusion_metadata(self, idx: int, extras: dict[str, Any]) -> None:  # <— NEW
+    def set_fusion_metadata(self, kernel_idx: int, extras: dict[str, Any]) -> None:
         with self.lock:
-            self.fusion_metadata[idx] = dict(extras)
+            self.fusion_metadata[kernel_idx] = dict(extras)
 
     # Returns the constant args
     def get_constant_args(self, idx: int) -> dict[str, Any]:
@@ -1777,9 +1776,9 @@ class TritonHOPifier:
                 for config in new_configs:
                     for name in special_param_names:
                         if name not in config.__dict__["kwargs"]:
-                            assert (
-                                name in config.__dict__
-                            ), f"{name} must be in autotuning configs to be used as a kernel parameter"
+                            assert name in config.__dict__, (
+                                f"{name} must be in autotuning configs to be used as a kernel parameter"
+                            )
                             config.__dict__["kwargs"][name] = config.__dict__[name]
                             updated = True
 
@@ -2032,9 +2031,8 @@ class TracingTritonHOPifier(TritonHOPifier):
     ) -> None:
         assert tx is None
         assert isinstance(variable, TraceableTritonKernelWrapper)
-        graphable_args, constant_args_idx = self.store_non_graphable_args(
-            combined_args,
-        )
+        graphable_args, constant_args_idx = self.store_non_graphable_args(combined_args)
+
         kernel_side_table.set_fusion_metadata(
             variable.kernel_idx,
             {"attempt_fusion": bool(getattr(variable, "attempt_fusion", False))},

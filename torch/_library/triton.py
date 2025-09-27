@@ -10,6 +10,7 @@ from torch.utils._exposed_in import exposed_in
 from .custom_ops import custom_op, CustomOpDef
 from .infer_schema import infer_schema
 
+
 attempt_fusion_enabled = threading.local()
 attempt_fusion_enabled.attempt_fusion = False  # default
 
@@ -25,7 +26,7 @@ def set_fusion_status(attempt_fusion: bool) -> Generator[None, None, None]:
 
 
 def is_fusion_allowed() -> bool:
-    return getattr(attempt_fusion_enabled, "attempt_fusion")
+    return attempt_fusion_enabled.attempt_fusion
 
 
 triton_ops_to_kernels: dict[str, list[object]] = {}
