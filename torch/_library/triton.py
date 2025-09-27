@@ -10,23 +10,22 @@ from torch.utils._exposed_in import exposed_in
 from .custom_ops import custom_op, CustomOpDef
 from .infer_schema import infer_schema
 
-import contextvars
-from contextlib import contextmanager
+attempt_fusion_enabled = threading.local()
+attempt_fusion_enabled.attempt_fusion = False  # default
 
-_fusion_meta = threading.local()
-_fusion_meta.attempt_fusion = False  # Set default
 
-@contextmanager
-def fusion_meta(attempt_fusion: bool) -> Generator[None, None, None]:
-    prior = getattr(_fusion_meta, "attempt_fusion", False)
-    _fusion_meta.attempt_fusion = bool(attempt_fusion)
+@contextlib.contextmanager
+def set_fusion_status(attempt_fusion: bool) -> Generator[None, None, None]:
+    prior = getattr(attempt_fusion_enabled, "attempt_fusion", False)
+    attempt_fusion_enabled.attempt_fusion = bool(attempt_fusion)
     try:
         yield
     finally:
-        _fusion_meta.attempt_fusion = prior
+        attempt_fusion_enabled.attempt_fusion = prior
 
-def current_fusion_meta() -> bool:
-    return getattr(_fusion_meta, "attempt_fusion", False)
+
+def is_fusion_allowed() -> bool:
+    return getattr(attempt_fusion_enabled, "attempt_fusion")
 
 
 triton_ops_to_kernels: dict[str, list[object]] = {}
@@ -220,7 +219,7 @@ def triton_op(
         # so we can just register it as the Fake/meta kernel.
         def _fake_wrapper(*a, **k):
             # ensure the very first meta/fake run has the same default
-            with fusion_meta(attempt_fusion=attempt_fusion):
+            with set_fusion_status(attempt_fusion=attempt_fusion):
                 return fn(*a, **k)
 
         result.register_fake(_fake_wrapper)
@@ -271,7 +270,7 @@ def triton_op(
 
                 if unrecognized_types:
                     return NotImplemented
-                with mode, fusion_meta(attempt_fusion=attempt_fusion):
+                with mode, set_fusion_status(attempt_fusion=attempt_fusion):
                     return fn(*args, **kwargs)
 
         triton_kernels = get_inner_triton_kernels(fn)
@@ -394,7 +393,7 @@ def wrap_triton(
         return triton_kernel
 
     if attempt_fusion is None:
-        attempt_fusion = bool(current_fusion_meta())
+        attempt_fusion = bool(is_fusion_allowed())
     print("DONT SHOOT", attempt_fusion)
 
     return TraceableTritonKernelWrapper(
