@@ -5212,6 +5212,7 @@ class InputsKernel(OperationBuffer):
         return input.get_name()
 
     def get_read_writes(self) -> dependencies.ReadWrites:
+        print("MOLO")
         reads = OrderedSet[dependencies.Dep]()
         StarDep = dependencies.StarDep
         for input in self.inputs:
@@ -6885,6 +6886,22 @@ class UserDefinedTritonKernel(ExternKernel):
 
     def get_device(self) -> Optional[torch.device]:
         return self.device
+
+@ir_dataclass(frozen=False)
+class FusableUserDefinedTritonKernel(UserDefinedTritonKernel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+    
+    def __getattribute__(self, name):
+        attr = super().__getattribute__(name)
+        
+        if callable(attr) and not name.startswith('_'):
+            def wrapper(*args, **kwargs):
+                # print(f"Calling {name} with args: {args}, kwargs: {kwargs}")
+                return attr(*args, **kwargs)
+            return wrapper
+        
+        return attr
 
 
 class InplaceBernoulliFallback(ExternKernel):

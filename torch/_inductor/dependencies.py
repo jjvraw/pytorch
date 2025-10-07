@@ -643,6 +643,8 @@ def extract_read_writes(
     from .loop_body import LoopBody
 
     if isinstance(fn, LoopBody):
+        print('FAST path')
+        print(fn)
         inner = extract_loop_body_with_args(
             fn,
             [*args, *hidden_args],  # type: ignore[list-item]
@@ -651,6 +653,7 @@ def extract_read_writes(
         )
     else:
         # Slow path tracing the function
+        print("SLOW PATH")
         rw = RecordLoadStore(var_ranges, normalize=normalize)
         with V.set_ops_handler(rw):
             fn(*args, *hidden_args)

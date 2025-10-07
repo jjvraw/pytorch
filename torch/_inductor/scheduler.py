@@ -1138,7 +1138,9 @@ class ExternKernelSchedulerNode(BaseSchedulerNode):
     def __init__(self, scheduler: Scheduler, node: ir.Operation) -> None:
         super().__init__(scheduler)
         self._init_from_node(node)
+        print(type(node))
         self.set_read_writes(node.get_read_writes())
+        print("EXTERN CALLED")
 
     def debug_str_extra(self) -> str:
         return f"{self.get_name()}.node.kernel = {getattr(self.node, 'python_kernel_name', None)}"
@@ -1186,6 +1188,7 @@ class SchedulerNode(BaseSchedulerNode):
             extra_indexing_constraints=extra_indexing_constraints,
             recompute_sizes_body_func=recompute_sizes_body_func,
         )
+        print("Initial body: ", body.root_block)
         self._body = body  # type: ignore[assignment]
 
         device = self.node.get_device_or_error()
@@ -2255,6 +2258,9 @@ class Scheduler:
 
     def _init(self, nodes: list[ir.Operation]) -> None:
         super().__init__()
+        # for node in nodes:
+        #     print(node, "\n\n")
+        print(len(nodes))
         V.graph.scheduler = self
         self.backends: dict[torch.device, BaseScheduling] = {}
         self.post_grad_graph_id = next(_post_grad_graph_counter)
