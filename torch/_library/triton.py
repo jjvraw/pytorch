@@ -395,7 +395,6 @@ def wrap_triton(
 
     if attempt_fusion is None:
         attempt_fusion = bool(is_fusion_allowed())
-    print("DONT SHOOT", attempt_fusion)
 
     return TraceableTritonKernelWrapper(
         triton_kernel, None, None, attempt_fusion=attempt_fusion

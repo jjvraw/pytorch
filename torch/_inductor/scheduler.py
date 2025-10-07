@@ -50,6 +50,8 @@ from .dependencies import Dep, MemoryDep, StarDep, WeakDep
 from .exc import GPUTooOldForTriton, TritonMissing
 from .fx_utils import count_flops_fx
 from .ir import (
+    ExternKernel,
+    FusableUserDefinedTritonKernel,
     get_device_type,
     GraphPartitionSignature,
     MultiOutput,
@@ -481,6 +483,9 @@ class BaseSchedulerNode:
         return False
 
     def is_extern(self) -> bool:
+        return False
+
+    def is_fusable_user_triton(self) -> bool:
         return False
 
     def is_foreach(self) -> bool:
@@ -1133,14 +1138,31 @@ def _prune_redundant_deps(
         node.unmet_dependencies = node.unmet_dependencies - deps_to_prune
         node.set_read_writes(node.read_writes.remove_reads(deps_to_prune))
 
+class FusableUserDefinedKernelSchedulerNode(BaseSchedulerNode):
+
+    def __init__(self, scheduler: Scheduler, node: ir.Operation):
+        super().__init__(scheduler)
+        # TODO: for now, we'll use StarDep like ExternKernelSchedulerNode
+        self._init_from_node(node)
+        self.set_read_writes(node.get_read_writes())
+        print("Init FusableUserDefinedKernelSchedulerNode")
+
+        # assert isinstance(node, FusableUserDefinedKernelSchedulerNode)
+        # print("kernel idx", self.node)
+
+    def is_extern(self):
+        # TODO: Currently we'll mark keep this as False until we see problems.
+        # (since we still rely a lot of ExternKernel functionality)
+        return super().is_extern()
+
+    def is_fusable_user_triton(self) -> bool:
+        return True
 
 class ExternKernelSchedulerNode(BaseSchedulerNode):
     def __init__(self, scheduler: Scheduler, node: ir.Operation) -> None:
         super().__init__(scheduler)
         self._init_from_node(node)
-        print(type(node))
         self.set_read_writes(node.get_read_writes())
-        print("EXTERN CALLED")
 
     def debug_str_extra(self) -> str:
         return f"{self.get_name()}.node.kernel = {getattr(self.node, 'python_kernel_name', None)}"
@@ -1188,7 +1210,6 @@ class SchedulerNode(BaseSchedulerNode):
             extra_indexing_constraints=extra_indexing_constraints,
             recompute_sizes_body_func=recompute_sizes_body_func,
         )
-        print("Initial body: ", body.root_block)
         self._body = body  # type: ignore[assignment]
 
         device = self.node.get_device_or_error()
@@ -2258,9 +2279,6 @@ class Scheduler:
 
     def _init(self, nodes: list[ir.Operation]) -> None:
         super().__init__()
-        # for node in nodes:
-        #     print(node, "\n\n")
-        print(len(nodes))
         V.graph.scheduler = self
         self.backends: dict[torch.device, BaseScheduling] = {}
         self.post_grad_graph_id = next(_post_grad_graph_counter)
@@ -2474,6 +2492,8 @@ class Scheduler:
             return NopKernelSchedulerNode(self, node)
         elif isinstance(node, (ir.ComputedBuffer, ir.TemplateBuffer)):
             return SchedulerNode(self, node)
+        elif isinstance(node, ir.FusableUserDefinedTritonKernel):
+            return FusableUserDefinedKernelSchedulerNode(self, node)
         elif isinstance(node, ir.ExternKernel):
             return ExternKernelSchedulerNode(self, node)
         else:
@@ -4027,7 +4047,11 @@ class Scheduler:
         Is this node unfusable under any conditions.
         """
         return (
-            isinstance(node, (ExternKernelSchedulerNode, NopKernelSchedulerNode))
+            isinstance(node, (
+                ExternKernelSchedulerNode,
+                NopKernelSchedulerNode,
+                FusableUserDefinedKernelSchedulerNode # TODO: Remove this when appropriate.
+            ))
             and not node.is_template()
             and not is_output_of_multi_outputs_template(node.node)
         )
@@ -4616,6 +4640,43 @@ class Scheduler:
         assert isinstance(node, ir.ExternKernel), f"{type(node)=}"
         node.codegen(V.graph.wrapper_code)
         self.free_buffers()
+
+    def codegen_fusable_user_defined_triton_kernel(
+            self,
+            scheduler_node: FusableUserDefinedKernelSchedulerNode
+    ) -> None:
+
+        print("calling codegen_fusable...")
+
+        # TODO: This follows `codegen_extern_call` implementatioon for now.
+        # We will have to generate a modified kernel with fused operations.
+
+        assert isinstance(scheduler_node, FusableUserDefinedKernelSchedulerNode)
+
+        # TODO: where exactly is `counters` used...? 
+        counters["inductor"]["fusable_user_defined_triton_kernel"] += 1
+
+
+        # TODO: Standard inplace update and buffer allocation.
+        # We will have to review if inplace decisions are valid for fused buffers.
+        # When we fuse operations, the buffer dependency graph changes.
+        with V.set_kernel_handler(Kernel(increase_kernel_count=False)):
+            scheduler_node.decide_inplace_update()
+            scheduler_node.mark_run()
+
+        node = scheduler_node.node
+        assert isinstance(node, ir.FusableUserDefinedTritonKernel), f"{type(node)=}"
+        
+        # TODO: Use unmodified kernel for now.
+        node.codegen(V.graph.wrapper_code)
+        self.free_buffers()
+
+        
+
+
+
+
+
 
     def create_backend(self, device: torch.device) -> BaseScheduling:
         assert not is_gpu(device.type) or device.index is not None, (
@@ -5458,6 +5519,9 @@ class Scheduler:
             elif node.is_extern():
                 node = typing.cast(ExternKernelSchedulerNode, node)
                 self.codegen_extern_call(node)
+            elif node.is_fusable_user_triton():
+                node = typing.cast(FusableUserDefinedKernelSchedulerNode, node)
+                self.codegen_fusable_user_defined_triton_kernel(node)
             elif node.is_foreach():
                 node = typing.cast(ForeachKernelSchedulerNode, node)
                 backend_ = self.get_backend(device)

@@ -2018,7 +2018,6 @@ class TracingTritonHOPifier(TritonHOPifier):
 
         constant_args_idx = kernel_side_table.add_constant_args(non_graphable_args)
 
-        print("Stop you coming and come", kernel_side_table.fusion_metadata)
 
         return graphable_args, constant_args_idx
 
@@ -2068,7 +2067,6 @@ class TraceableTritonKernelWrapper:
         self.kernel = None
         self.grid = None
         self.attempt_fusion = attempt_fusion
-        print("Inside TTW", attempt_fusion)
         tracing_triton_hopifier_singleton.init_variable(self, kernel, kernel_idx, grid)
         assert self.kernel is not None
 

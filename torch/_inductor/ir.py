@@ -5212,7 +5212,6 @@ class InputsKernel(OperationBuffer):
         return input.get_name()
 
     def get_read_writes(self) -> dependencies.ReadWrites:
-        print("MOLO")
         reads = OrderedSet[dependencies.Dep]()
         StarDep = dependencies.StarDep
         for input in self.inputs:
@@ -6891,18 +6890,12 @@ class UserDefinedTritonKernel(ExternKernel):
 class FusableUserDefinedTritonKernel(UserDefinedTritonKernel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-    
-    def __getattribute__(self, name):
-        attr = super().__getattribute__(name)
-        
-        if callable(attr) and not name.startswith('_'):
-            def wrapper(*args, **kwargs):
-                # print(f"Calling {name} with args: {args}, kwargs: {kwargs}")
-                return attr(*args, **kwargs)
-            return wrapper
-        
-        return attr
 
+    def get_read_writes(self):
+        # TODO: Override InputsKernel.get_read_writes() to provide finer-grained dependencies.
+        # Currently parent creates whole-buffer (StarDep) for all inputs/outputs.
+        return super().get_read_writes()
+    
 
 class InplaceBernoulliFallback(ExternKernel):
     """
