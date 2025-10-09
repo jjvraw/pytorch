@@ -1142,13 +1142,27 @@ class FusableUserDefinedKernelSchedulerNode(BaseSchedulerNode):
 
     def __init__(self, scheduler: Scheduler, node: ir.Operation):
         super().__init__(scheduler)
-        # TODO: for now, we'll use StarDep like ExternKernelSchedulerNode
         self._init_from_node(node)
-        self.set_read_writes(node.get_read_writes())
-        print("Init FusableUserDefinedKernelSchedulerNode")
+        
+        read_writes = node.get_read_writes()
+        print(f"get_read_writes returned:")
+        print(f"\treads: {read_writes.reads}")
+        print(f"\twrites: {read_writes.writes}")
+        
+        self.set_read_writes(read_writes)
+        print(f"\tunmet_dependencies: {self.unmet_dependencies}")
 
-        # assert isinstance(node, FusableUserDefinedKernelSchedulerNode)
-        # print("kernel idx", self.node)
+    def add_fake_dep(self, dep: Dep) -> None:
+        return
+        # if isinstance(dep, StarDep):
+        #     has_memory_dep = any(
+        #         isinstance(d, MemoryDep) and d.name == dep.name
+        #         for d in self.read_writes.reads
+        #     )
+        #     if has_memory_dep:
+        #         return
+        # 
+        # super().add_fake_dep(dep)
 
     def is_extern(self):
         # TODO: Currently we'll mark keep this as False until we see problems.
@@ -3731,6 +3745,11 @@ class Scheduler:
                     + 1
                     + config.max_fusion_buffer_group_pairwise_attempts
                 ]:
+
+                    if node1.is_fusable_user_triton():
+                        print(f"custom GeLU considering {node2=}")
+                        continue
+
                     key = (node1, node2)
                     if key in seen:
                         continue
@@ -3750,6 +3769,9 @@ class Scheduler:
                 continue
             for buf in node.used_buffer_names():
                 buffer_names_grouping[buf].append(node)
+
+        print(f"{buffer_names_grouping=}")
+
         for node_grouping in buffer_names_grouping.values():
             check_all_pairs(node_grouping)
 
@@ -4050,7 +4072,6 @@ class Scheduler:
             isinstance(node, (
                 ExternKernelSchedulerNode,
                 NopKernelSchedulerNode,
-                FusableUserDefinedKernelSchedulerNode # TODO: Remove this when appropriate.
             ))
             and not node.is_template()
             and not is_output_of_multi_outputs_template(node.node)
@@ -4667,15 +4688,9 @@ class Scheduler:
         node = scheduler_node.node
         assert isinstance(node, ir.FusableUserDefinedTritonKernel), f"{type(node)=}"
         
-        # TODO: Use unmodified kernel for now.
+        # TODO: Use ir.UserDefinedKernel.codegen kernel for now.
         node.codegen(V.graph.wrapper_code)
         self.free_buffers()
-
-        
-
-
-
-
 
 
     def create_backend(self, device: torch.device) -> BaseScheduling:

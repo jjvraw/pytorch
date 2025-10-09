@@ -6892,10 +6892,65 @@ class FusableUserDefinedTritonKernel(UserDefinedTritonKernel):
         super().__init__(*args, **kwargs)
 
     def get_read_writes(self):
-        # TODO: Override InputsKernel.get_read_writes() to provide finer-grained dependencies.
-        # Currently parent creates whole-buffer (StarDep) for all inputs/outputs.
-        return super().get_read_writes()
-    
+
+        # TODO: Currently this is entirely hardcoded for our custom triton kernel.
+        # This is where our (generic) analysis will take place. Probably the crux 
+        # of thesis.
+
+
+        input_buf = self.inputs[0] # buf0 - from nop
+        mutated_buf = self.mutable_args[0]  # buf1 - what we're mutating
+        output_buf = self.get_outputs()[0]   # buf2 - the MutationOutput
+        
+        # Currently setup using dimension-based indexing.
+        # This will eventually have to be cannonicalised (I assume)
+        # during/for fusion analysis.
+        d0 = sympy.Symbol('d0', integer=True, nonnegative=True)
+        d1 = sympy.Symbol('d1', integer=True, nonnegative=True)
+        
+        layout = mutated_buf.get_layout()
+        index_expr = layout.stride[0] * d0 + d1
+        var_names = (d0, d1)
+        size = tuple(layout.size)
+        
+        reads = OrderedSet([
+            dependencies.MemoryDep(
+                name=input_buf.get_name(),  # buf0
+                index=index_expr,
+                var_names=var_names,
+                size=size,
+                mode=None
+            ),
+            dependencies.MemoryDep(
+                name=mutated_buf.get_name(),  # buf1 - reading before mutation
+                index=index_expr,
+                var_names=var_names,
+                size=size,
+                mode=None
+            )
+        ])
+        
+        # We write to the OUTPUT buffer name, not the mutated buffer.
+        # This is obvious in hindsight, but I made an issue of this prior,
+        # so just making a note here.
+        writes = OrderedSet([
+            dependencies.MemoryDep(
+                name=output_buf.get_name(), 
+                index=index_expr,
+                var_names=var_names,
+                size=size,
+                mode=None
+            )
+        ])
+        
+        return dependencies.ReadWrites(
+            reads=reads,
+            writes=writes,
+            index_exprs=OrderedSet([index_expr]),
+            range_vars=None,
+            var_ranges=None
+        )
+
 
 class InplaceBernoulliFallback(ExternKernel):
     """

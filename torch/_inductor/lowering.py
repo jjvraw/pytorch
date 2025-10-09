@@ -7063,8 +7063,7 @@ def triton_kernel_wrap_(
     from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
 
     constant_args = kernel_side_table.get_constant_args(constant_args_idx)
-    attempt_fusion = kernel_side_table.get_fusion_metadata(kernel_idx)
-
+    attempt_fusion = kernel_side_table.get_fusion_metadata(kernel_idx).get("attempt_fusion", False)
     if not attempt_fusion:
         ir.UserDefinedTritonKernel(
             kernel_idx=kernel_idx,
