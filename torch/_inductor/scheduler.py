@@ -1143,14 +1143,43 @@ class FusableUserDefinedKernelSchedulerNode(BaseSchedulerNode):
     def __init__(self, scheduler: Scheduler, node: ir.Operation):
         super().__init__(scheduler)
         self._init_from_node(node)
-        
-        read_writes = node.get_read_writes()
-        print(f"get_read_writes returned:")
-        print(f"\treads: {read_writes.reads}")
-        print(f"\twrites: {read_writes.writes}")
+        self._compute_attrs()
+
+
+    def _compute_attrs(self) -> None:
+        assert isinstance(self.node, ir.FusableUserDefinedTritonKernel)
+
+        # Get non-canonicalised sizes
+        mutated_buf = self.node.mutable_args[0] #type: ignore
+        layout = mutated_buf.get_layout()
+        self._sizes = (tuple(layout.size), ())
+
+        print(f"{self._sizes=}")
+
+
+        device = self.node.get_device_or_error() #type: ignore
+        group_fn = self.scheduler.get_backend(device).group_fn
+        self.group = (device, group_fn(self._sizes))
+
+        print(f"{self.group=}")
+
+        read_writes = self.node.get_read_writes() #type: ignore
+        print(f"{read_writes.reads=}")
+        print(f"{read_writes.writes=}")
         
         self.set_read_writes(read_writes)
-        print(f"\tunmet_dependencies: {self.unmet_dependencies}")
+        print(f"{self.unmet_dependencies=}")
+
+
+    def get_ranges(self) -> Sequence[Sequence[sympy.Expr]]:
+        return self._sizes
+
+
+    def is_extern(self):
+        # TODO: Currently we'll mark keep this as False until we see problems.
+        # (since we still rely a lot of ExternKernel functionality)
+        return super().is_extern()
+
 
     def add_fake_dep(self, dep: Dep) -> None:
         return
@@ -1163,11 +1192,6 @@ class FusableUserDefinedKernelSchedulerNode(BaseSchedulerNode):
         #         return
         # 
         # super().add_fake_dep(dep)
-
-    def is_extern(self):
-        # TODO: Currently we'll mark keep this as False until we see problems.
-        # (since we still rely a lot of ExternKernel functionality)
-        return super().is_extern()
 
     def is_fusable_user_triton(self) -> bool:
         return True
@@ -3641,6 +3665,7 @@ class Scheduler:
             resolve_pending_fusions(node1, node2)
             node1 = self.get_fused_node(node1)
             node2 = self.get_fused_node(node2)
+            print(node1, node2, "inside can_fuse")
 
             if self.can_fuse(
                 node1, node2, is_reorder_round
@@ -3745,11 +3770,6 @@ class Scheduler:
                     + 1
                     + config.max_fusion_buffer_group_pairwise_attempts
                 ]:
-
-                    if node1.is_fusable_user_triton():
-                        print(f"custom GeLU considering {node2=}")
-                        continue
-
                     key = (node1, node2)
                     if key in seen:
                         continue
@@ -4244,6 +4264,8 @@ class Scheduler:
         Determine if it is possible to combine node1 and node2 into a
         single fused node.
         """
+
+        print(f"inside can_fuse {node1=}, {node2=}")
         if node1 is node2:
             return False
 
@@ -4341,6 +4363,18 @@ class Scheduler:
         ):
             why("template epilogue not satisfied")
             return False
+
+        # TODO: Early rejections for fusable user triton.
+        # Perhaps we can do something like 
+        # if (nodeX.is_template() or nodeX.is_fusable_user_triton()) ...
+        # and fall under the epilogue/prologue fusion conditions above.
+        if node1.is_fusable_user_triton():
+            print("user kernel is producer")
+            pass
+
+        if node2.is_fusable_user_triton():
+            print("user kernel is consumer")
+            pass
 
         if (node1.get_buffer_names() & V.graph.no_fuse_buffer_names) or (
             node2.get_buffer_names() & V.graph.no_fuse_buffer_names
