@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 from ..debug import set_kernel_post_grad_provenance_tracing
 from ..optimize_indexing import indexing_dtype_strength_reduction
 from ..runtime.runtime_utils import green_text, yellow_text
-from ..scheduler import BaseSchedulerNode, BaseScheduling, WhyNoFuse
+from ..scheduler import BaseSchedulerNode, BaseScheduling, FusableUserDefinedKernelSchedulerNode, WhyNoFuse
 from ..utils import (
     cache_property_on_self,
     expr_fits_within_32bit,
@@ -1402,6 +1402,11 @@ class SIMDScheduling(BaseScheduling):
 
         nodes: list[scheduler.SchedulerNode] = node.get_nodes()  # type: ignore[assignment]
 
+        user_kernel_nodes = [n for n in nodes if isinstance(n, scheduler.FusableUserDefinedKernelSchedulerNode)]
+
+        # if user_kernel_nodes:
+        #     return self.codegen_user_defined_kernel_fusion(node, user_kernel_nodes, nodes)
+
         if torch._inductor.config.triton.coalesce_tiling_analysis:
             coalesce_analysis = analyze_memory_coalescing(node)
         else:
@@ -1413,6 +1418,39 @@ class SIMDScheduling(BaseScheduling):
 
         return self.codegen_node_schedule(
             SIMDKernelFeatures(node_schedule, numel, rnumel, coalesce_analysis)
+        )
+
+    def codegen_user_defined_kernel_fusion(self, fused_node, user_kernel_nodes, all_nodes):
+        print("=" * 5, "CUSTOM CODEGEN PATH FOR USER KERNEL", "=" * 5)
+        
+
+
+
+    def emit_fused_kernel_call(self, kernel_name, user_kernel_node, consumer_nodes):
+        # choose 1st read as input, 1st write as output for Phase 1
+        rd = next(iter(user_kernel_node.read_writes.reads)).name
+        wr = next(iter(user_kernel_node.read_writes.writes)).name
+
+        in_name = rd
+        out_name = wr
+
+        # derive shape/stride/dtype/numel
+        out_layout = V.graph.get_buffer(out_name).get_layout()
+        out_size = tuple(out_layout.size)
+        out_stride = tuple(out_layout.stride)
+        out_dtype = V.graph.get_dtype(out_name)
+        numel = V.graph.sizevars.size_hint(V.graph.get_numel(out_name))
+
+        V.graph.wrapper_code.writeline(
+            f"{out_name} = empty_strided_cuda({out_size}, {out_stride}, {out_dtype!r})"
+        )
+
+        dev = V.graph.get_current_device_or_throw()
+        V.graph.wrapper_code.writeline(f"stream0 = get_raw_stream({dev.index})")
+
+        # Your kernel ignores the xnumel arg and uses its baked constant; that's fine.
+        V.graph.wrapper_code.writeline(
+            f"{kernel_name}.run({in_name}, {out_name}, {numel}, stream=stream0)"
         )
 
     @staticmethod
@@ -1747,6 +1785,13 @@ class SIMDScheduling(BaseScheduling):
             )
             for shape in shapes
         )
+
+    def codegen_fusable_user_defiend_triton_kernel(
+        self,
+        scheduler_node: FusableUserDefinedKernelSchedulerNode
+    ):
+        pass
+
 
     def codegen_template(
         self,

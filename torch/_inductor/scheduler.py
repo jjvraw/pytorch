@@ -1144,6 +1144,29 @@ class FusableUserDefinedKernelSchedulerNode(BaseSchedulerNode):
         super().__init__(scheduler)
         self._init_from_node(node)
         self._compute_attrs()
+        self._body = self._create_dummy_body()
+
+    def _create_dummy_body(self):
+        """
+        Create a body with hardcoded metadata that represents our GELU kernel.
+        """
+        class DummyBody:
+            # Hardcode: GELU operation counts (for cost modeling)
+            op_counts = {
+                'mul': 2,      # x * 1.702, x * sigmoid_val
+                'exp': 1,      # exp(-sigmoid_input)
+                'add': 1,      # 1.0 + exp(...)
+                'div': 1,      # 1.0 / (...)
+            }
+            
+            # Hardcode: pointwise operation (no reduction)
+            def get_reduction_type(self):
+                return None
+            
+            def get_reduction_size(self):
+                return []
+        
+        return DummyBody()
 
 
     def _compute_attrs(self) -> None:
@@ -1173,6 +1196,32 @@ class FusableUserDefinedKernelSchedulerNode(BaseSchedulerNode):
 
     def get_ranges(self) -> Sequence[Sequence[sympy.Expr]]:
         return self._sizes
+
+
+    def pointwise_or_reduction_read_writes(
+        self, pointwise: bool = True
+    ) -> dependencies.ReadWrites:
+        """
+        Get the memory dependencies in either the pointwise or the reduction axes.
+        """
+        # TODO: 
+        keep_sizes, ignore_sizes = self._sizes if pointwise else reversed(self._sizes)
+        
+        # For user-defined kernels, we don't have a symbolic body to analyze,
+        # so we manually construct the ReadWrites with range_vars
+        full_rw = self.node.get_read_writes() #type: ignore
+        
+        # Create range variables for the dimensions we're keeping
+        range_vars = [sympy.Symbol(f"d{i}", integer=True) for i in range(len(keep_sizes))]
+        
+        # Return ReadWrites with the range_vars attribute
+        return dependencies.ReadWrites(
+            reads=full_rw.reads,
+            writes=full_rw.writes,
+            index_exprs=full_rw.index_exprs if hasattr(full_rw, 'index_exprs') else set(),
+            range_vars=range_vars,
+            var_ranges={var: size for var, size in zip(range_vars, keep_sizes)},
+        )
 
 
     def is_extern(self):
@@ -1576,7 +1625,7 @@ class FusedSchedulerNode(BaseSchedulerNode):
         cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> FusedSchedulerNode:
         assert node1.scheduler is node2.scheduler
-        assert isinstance(node1, (SchedulerNode, FusedSchedulerNode))
+        assert isinstance(node1, (SchedulerNode, FusedSchedulerNode, FusableUserDefinedKernelSchedulerNode))
         if node1.is_template() and isinstance(node2, ExternKernelSchedulerNode):
             # Fuse multi outputs template and its outputs
             #   * Node1 has memorydep of MultiOutput in reads
@@ -1600,6 +1649,9 @@ class FusedSchedulerNode(BaseSchedulerNode):
                     ),
                 ]
             )
+        elif node1.is_fusable_user_triton() and isinstance(node2, SchedulerNode):
+            # TODO: are we violating anything? For now, lets continue with standard fusion logic?
+            pass
         else:
             assert isinstance(node2, (SchedulerNode, FusedSchedulerNode))
         nodes = list(itertools.chain(node1.get_nodes(), node2.get_nodes()))
@@ -4093,6 +4145,7 @@ class Scheduler:
                 ExternKernelSchedulerNode,
                 NopKernelSchedulerNode,
             ))
+            and node.is_fusable_user_triton() # TODO: Remove once codegen via `SIMDScheduling.codegen_user_defined..` isworking.
             and not node.is_template()
             and not is_output_of_multi_outputs_template(node.node)
         )
@@ -4701,30 +4754,10 @@ class Scheduler:
             scheduler_node: FusableUserDefinedKernelSchedulerNode
     ) -> None:
 
-        print("calling codegen_fusable...")
+        #TODO: There will be some setup here, likely similar to codegen_extern_call
 
-        # TODO: This follows `codegen_extern_call` implementatioon for now.
-        # We will have to generate a modified kernel with fused operations.
+        return
 
-        assert isinstance(scheduler_node, FusableUserDefinedKernelSchedulerNode)
-
-        # TODO: where exactly is `counters` used...? 
-        counters["inductor"]["fusable_user_defined_triton_kernel"] += 1
-
-
-        # TODO: Standard inplace update and buffer allocation.
-        # We will have to review if inplace decisions are valid for fused buffers.
-        # When we fuse operations, the buffer dependency graph changes.
-        with V.set_kernel_handler(Kernel(increase_kernel_count=False)):
-            scheduler_node.decide_inplace_update()
-            scheduler_node.mark_run()
-
-        node = scheduler_node.node
-        assert isinstance(node, ir.FusableUserDefinedTritonKernel), f"{type(node)=}"
-        
-        # TODO: Use ir.UserDefinedKernel.codegen kernel for now.
-        node.codegen(V.graph.wrapper_code)
-        self.free_buffers()
 
 
     def create_backend(self, device: torch.device) -> BaseScheduling:
@@ -5570,7 +5603,7 @@ class Scheduler:
                 self.codegen_extern_call(node)
             elif node.is_fusable_user_triton():
                 node = typing.cast(FusableUserDefinedKernelSchedulerNode, node)
-                self.codegen_fusable_user_defined_triton_kernel(node)
+                self.get_backend(device).codegen_fusable_user_defiend_triton_kernel(node)
             elif node.is_foreach():
                 node = typing.cast(ForeachKernelSchedulerNode, node)
                 backend_ = self.get_backend(device)
@@ -5782,6 +5815,15 @@ class BaseScheduling:
     ) -> tuple[tuple[sympy.Expr, ...], ...]:
         """
         Process the iteration sizes in case a transformation needs to be applied.
+        """
+        raise NotImplementedError
+
+    def codegen_fusable_user_defiend_triton_kernel(
+        self,
+        scheduler_node: FusableUserDefinedKernelSchedulerNode,
+    ) -> Optional[str]:
+        """
+        TODO
         """
         raise NotImplementedError
 

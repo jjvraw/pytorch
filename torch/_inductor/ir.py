@@ -6891,7 +6891,7 @@ class FusableUserDefinedTritonKernel(UserDefinedTritonKernel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def get_read_writes(self):
+    def get_read_writes(self) -> dependencies.ReadWrites:
 
         # TODO: Currently this is entirely hardcoded for our custom triton kernel.
         # This is where our (generic) analysis will take place. Probably the crux 
