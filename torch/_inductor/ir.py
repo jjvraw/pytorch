@@ -6891,6 +6891,13 @@ class FusableUserDefinedTritonKernel(UserDefinedTritonKernel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+    def make_kernel_render(self):
+        kernel, configs, _, _ = self.get_kernel_and_metadata()
+
+        print("INSIDE MAKE_KERNEL_RENDER")
+        print(f"{kernel=}")
+    
+
     def get_read_writes(self) -> dependencies.ReadWrites:
 
         # TODO: Currently this is entirely hardcoded for our custom triton kernel.

@@ -4145,7 +4145,7 @@ class Scheduler:
                 ExternKernelSchedulerNode,
                 NopKernelSchedulerNode,
             ))
-            and node.is_fusable_user_triton() # TODO: Remove once codegen via `SIMDScheduling.codegen_user_defined..` isworking.
+            or node.is_fusable_user_triton() # TODO: Remove once codegen via `SIMDScheduling.codegen_user_defined..` isworking.
             and not node.is_template()
             and not is_output_of_multi_outputs_template(node.node)
         )
@@ -4748,17 +4748,6 @@ class Scheduler:
         assert isinstance(node, ir.ExternKernel), f"{type(node)=}"
         node.codegen(V.graph.wrapper_code)
         self.free_buffers()
-
-    def codegen_fusable_user_defined_triton_kernel(
-            self,
-            scheduler_node: FusableUserDefinedKernelSchedulerNode
-    ) -> None:
-
-        #TODO: There will be some setup here, likely similar to codegen_extern_call
-
-        return
-
-
 
     def create_backend(self, device: torch.device) -> BaseScheduling:
         assert not is_gpu(device.type) or device.index is not None, (
@@ -5603,6 +5592,7 @@ class Scheduler:
                 self.codegen_extern_call(node)
             elif node.is_fusable_user_triton():
                 node = typing.cast(FusableUserDefinedKernelSchedulerNode, node)
+                print(type(self.get_backend(device)))
                 self.get_backend(device).codegen_fusable_user_defiend_triton_kernel(node)
             elif node.is_foreach():
                 node = typing.cast(ForeachKernelSchedulerNode, node)

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Any, Optional, TYPE_CHECKING, Union
 
+from torch._inductor.ir import FusableUserDefinedTritonKernel
+
 from ..scheduler import (
     BaseSchedulerNode,
     BaseScheduling,
@@ -93,6 +95,16 @@ class CUDACombinedScheduling(BaseScheduling):
         self, sizes: Sequence[Sequence[_IntLike]]
     ) -> tuple[tuple[_IntLike, ...], ...]:
         return self._triton_scheduling.group_fn(sizes)
+
+    def codegen_fusable_user_defiend_triton_kernel(
+        self,
+        scheduler_node
+    ):
+
+        iir_node = scheduler_node.node
+        assert isinstance(iir_node, FusableUserDefinedTritonKernel)
+        render = iir_node.make_kernel_render() # type: ignore
+
 
     def codegen_template(
         self,

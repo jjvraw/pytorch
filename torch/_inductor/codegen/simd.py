@@ -1786,13 +1786,6 @@ class SIMDScheduling(BaseScheduling):
             for shape in shapes
         )
 
-    def codegen_fusable_user_defiend_triton_kernel(
-        self,
-        scheduler_node: FusableUserDefinedKernelSchedulerNode
-    ):
-        pass
-
-
     def codegen_template(
         self,
         template_node,
