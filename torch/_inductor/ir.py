@@ -6944,7 +6944,7 @@ class FusableUserDefinedTritonKernel(UserDefinedTritonKernel):
                 code=template_code,
                 replacement_hooks={
                     "<KERNEL_BODY>": kernel_body_hook,
-                    "<EPILOGUE_FUSION>": epilogue_hook  # Hardcoded for prototype
+                    "<EPILOGUE_FUSION>": epilogue_hook
                 }
             )
         
@@ -6981,7 +6981,7 @@ class FusableUserDefinedTritonKernel(UserDefinedTritonKernel):
                 mode=None
             ),
             dependencies.MemoryDep(
-                name=mutated_buf.get_name(),  # buf1 - reading before mutation
+                name=mutated_buf.get_name(),  # buf1
                 index=index_expr,
                 var_names=var_names,
                 size=size,

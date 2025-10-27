@@ -1147,11 +1147,7 @@ class FusableUserDefinedKernelSchedulerNode(BaseSchedulerNode):
         self._body = self._create_dummy_body()
 
     def _create_dummy_body(self):
-        """
-        Create a body with hardcoded metadata that represents our GELU kernel.
-        """
         class DummyBody:
-            # Hardcode: GELU operation counts (for cost modeling)
             op_counts = {
                 'mul': 2,      # x * 1.702, x * sigmoid_val
                 'exp': 1,      # exp(-sigmoid_input)
@@ -1159,7 +1155,6 @@ class FusableUserDefinedKernelSchedulerNode(BaseSchedulerNode):
                 'div': 1,      # 1.0 / (...)
             }
             
-            # Hardcode: pointwise operation (no reduction)
             def get_reduction_type(self):
                 return None
             
