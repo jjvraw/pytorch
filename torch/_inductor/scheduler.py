@@ -1795,6 +1795,11 @@ class FusedSchedulerNode(BaseSchedulerNode):
     def is_template(self) -> bool:
         return any(x.is_template() for x in self.snodes)
 
+
+    @cache_on_self
+    def is_fusable_user_triton(self) -> bool:
+        return any(x.is_fusable_user_triton() for x in self.snodes)
+
     @cache_on_self
     def get_template_node(self) -> Optional[ir.TemplateBuffer]:
         for node in self.snodes:
@@ -4145,7 +4150,7 @@ class Scheduler:
                 ExternKernelSchedulerNode,
                 NopKernelSchedulerNode,
             ))
-            or node.is_fusable_user_triton() # TODO: Remove once codegen via `SIMDScheduling.codegen_user_defined..` isworking.
+            # or node.is_fusable_user_triton() # TODO: Remove once codegen via `SIMDScheduling.codegen_user_defined..` isworking.
             and not node.is_template()
             and not is_output_of_multi_outputs_template(node.node)
         )
@@ -5593,7 +5598,7 @@ class Scheduler:
             elif node.is_fusable_user_triton():
                 node = typing.cast(FusableUserDefinedKernelSchedulerNode, node)
                 print(type(self.get_backend(device)))
-                self.get_backend(device).codegen_fusable_user_defiend_triton_kernel(node)
+                self.get_backend(device).codegen_fusable_user_defined_triton_kernel(node) # type: ignore
             elif node.is_foreach():
                 node = typing.cast(ForeachKernelSchedulerNode, node)
                 backend_ = self.get_backend(device)

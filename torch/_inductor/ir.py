@@ -42,6 +42,7 @@ import sympy
 from sympy import Expr, Integer, Symbol
 
 import torch._export.serde.schema as export_schema
+from torch._inductor.runtime.triton_heuristics import template
 import torch._library.utils as library_utils
 import torch._logging
 import torch.fx
@@ -6891,12 +6892,63 @@ class FusableUserDefinedTritonKernel(UserDefinedTritonKernel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def make_kernel_render(self):
-        kernel, configs, _, _ = self.get_kernel_and_metadata()
+        # # FIXME: I really dont like the way im doing this.
+        # self.mutable_buffer_to_kwarg: dict[str, str] = {}
+        # for key, value in self.kwargs.items():
+        #     for mutable_buf in self.mutable_args:
+        #         if value is mutable_buf:
+        #             self.mutable_buffer_to_kwarg[mutable_buf.get_name()] = key
+        #             break
 
+
+    def make_kernel_render(self):
         print("INSIDE MAKE_KERNEL_RENDER")
-        print(f"{kernel=}")
-    
+        from triton.runtime.jit import JITFunction # type: ignore
+        from .select_algorithm import PartialRender
+        kernel, configs, restore_value_args, reset_to_zero_args = self.get_kernel_and_metadata()
+
+        # TODO: For the specific example we are working on, there is no autotuning.
+        # thus the kernel is of type JITFunction.
+
+        assert isinstance(kernel, JITFunction)
+
+
+        kernel_wrapper = UserDefinedTritonKernelWrapper(
+            jit_kernel=kernel,
+            configs=configs,
+            restore_value_args=restore_value_args,
+            reset_to_zero_args=reset_to_zero_args,
+            user_defined_kernel=self,
+        )
+
+        kernel_src = kernel.src # type: ignore
+        def render():
+            modified_src = kernel_src.replace(
+                "tl.store(output_ptr + offsets, gelu_result, mask=mask)",
+                "<EPILOGUE_FUSION>\n"
+            )
+            
+            template_code = "<KERNEL_BODY>"
+
+            def kernel_body_hook():
+                return modified_src
+
+            def epilogue_hook():
+                return """
+    # Epilogue fusion
+    scaled = gelu_result * 0.5
+    tl.store(output_ptr + offsets, scaled, mask=mask)
+"""
+
+            return PartialRender(
+                code=template_code,
+                replacement_hooks={
+                    "<KERNEL_BODY>": kernel_body_hook,
+                    "<EPILOGUE_FUSION>": epilogue_hook  # Hardcoded for prototype
+                }
+            )
+        
+        return kernel_wrapper, render
 
     def get_read_writes(self) -> dependencies.ReadWrites:
 
@@ -6958,6 +7010,95 @@ class FusableUserDefinedTritonKernel(UserDefinedTritonKernel):
             var_ranges=None
         )
 
+
+class UserDefinedTritonKernelWrapper:
+    """Wrapper for user-defined Triton kernels to work with PartialRender.
+
+    TODO: Im not sure where this class should live.
+    """
+
+
+    def __init__(self, jit_kernel, configs, restore_value_args, reset_to_zero_args, user_defined_kernel):
+        self.jit_kernel = jit_kernel
+        self.configs = configs
+        self.restore_value_args = restore_value_args
+        self.reset_to_zero_args = reset_to_zero_args
+        self.user_defined_kernel = user_defined_kernel
+        
+        # TODO: Will need class vars for future prologue/epilogue nodes.
+        self.prologue_fused_inputs = OrderedSet()
+        self.removed_buffers = OrderedSet()  
+        self.inplaced_to_remove = OrderedSet()  
+        self.kernel_name = None
+        self.extra_launch_args = []
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, *args):
+        pass
+    
+    def call_kernel(self, name: str):
+        """Generate the kernel call code"""
+        from torch._inductor.utils import triton_version_uses_attrs_dict
+        
+        wrapper = V.graph.wrapper_code
+        user_kernel = self.user_defined_kernel
+        
+        named_args = {
+            k: user_kernel.get_kwargs_value(k) 
+            for k in user_kernel.ordered_kwargs_for_cpp_kernel
+        }
+        
+        constexpr_names = OrderedSet(
+            self.jit_kernel.arg_names[i] for i in self.jit_kernel.constexprs
+        )
+        
+        # Process arguments as UserDefinedTritonKernel.codegen
+        args: list[Any] = []
+        arg_types: list[Any] = []
+        raw_keys_filtered: list[Any] = []
+        raw_args_filtered: list[Any] = []
+        
+        for arg_name, arg in itertools.chain(
+            named_args.items(), 
+            zip(itertools.repeat(""), self.extra_launch_args)  # ← Add grid args!
+        ):
+            if arg_name in constexpr_names and triton_version_uses_attrs_dict():
+                continue
+            
+            raw_keys_filtered.append(arg_name)
+            raw_args_filtered.append(arg)
+            
+            if isinstance(arg, IRNode):
+                args.append(arg.codegen_reference())
+                arg_types.append(arg.get_dtype())
+            elif isinstance(arg, (int, float, bool, sympy.Expr)):
+                args.append(arg)
+                arg_types.append(type(arg))
+            elif arg_name in constexpr_names:
+                args.append(-1)
+                arg_types.append(int)
+            elif arg is None:
+                if triton_version_uses_attrs_dict():
+                    args.append(-1)
+                    arg_types.append(int)
+                else:
+                    raw_keys_filtered.pop()
+                    raw_args_filtered.pop()
+            else:
+                raise NotImplementedError(f"Unsupported arg type: {type(arg)}: {arg}")
+        
+        wrapper.generate_kernel_call(
+            name,
+            args,
+            arg_types=arg_types,
+            raw_args=raw_args_filtered,
+            raw_keys=raw_keys_filtered,
+            triton=True,
+            device=user_kernel.get_device(),
+            original_fxnode_name=user_kernel.fx_node.name,
+        )
 
 class InplaceBernoulliFallback(ExternKernel):
     """
