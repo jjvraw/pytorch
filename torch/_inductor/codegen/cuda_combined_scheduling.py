@@ -5,8 +5,6 @@ from typing import Any, Optional, TYPE_CHECKING, Union
 
 from torch._inductor.ir import FusableUserDefinedTritonKernel, IRNode, TensorBox
 
-from torch._inductor.ir import MutationOutput
-
 from ..scheduler import (
     BaseSchedulerNode,
     BaseScheduling,
@@ -116,7 +114,6 @@ class CUDACombinedScheduling(BaseScheduling):
                 - Combine the epilogue's computation into the user kernel's source code.
 
         """
-        print("INSIDE CODEGEN_FUSABLE_USER_DEFINED_TRITON_KERNEL")
         from ..virtualized import V
 
         nodes = scheduler_node.get_nodes()
@@ -151,7 +148,6 @@ class CUDACombinedScheduling(BaseScheduling):
         # For our example we only have one argument/buffer that is mutated.
         assert len(iir_node.mutable_args) == 1
         mutated_buffer_name = iir_node.mutable_args[0].get_name()
-        print(iir_node.mutable_args)
         assert isinstance(iir_node.mutable_args[0], TensorBox)
         
         # Get epilogue SchedulerBuffer.
@@ -185,7 +181,7 @@ class CUDACombinedScheduling(BaseScheduling):
 
             src_code = partial_code.code
 
-            print(src_code)
+            # print(src_code)
 
         # kernel_wrapper.jit_kernel.__dict__['src'] = src_code
         # kernel_wrapper.jit_kernel.src = src_code

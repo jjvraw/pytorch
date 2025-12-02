@@ -6889,8 +6889,22 @@ class UserDefinedTritonKernel(ExternKernel):
 
 @ir_dataclass(frozen=False)
 class FusableUserDefinedTritonKernel(UserDefinedTritonKernel):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self,
+                 *,
+                 kernel_idx:int,
+                 grid: Any,
+                 tma_descriptor_metadata: dict[str, Any],
+                 kernel_args: dict[str, Any]
+                 ):
+
+        # Store original args before parent transforms them.
+        self.original_kernel_args = kernel_args.copy()
+        super().__init__(
+            kernel_idx=kernel_idx,
+            grid=grid,
+            tma_descriptor_metadata=tma_descriptor_metadata,
+            kernel_args=kernel_args,
+        )
 
         # # FIXME: I really dont like the way im doing this.
         # self.mutable_buffer_to_kwarg: dict[str, str] = {}
@@ -6902,7 +6916,6 @@ class FusableUserDefinedTritonKernel(UserDefinedTritonKernel):
 
 
     def make_kernel_render(self):
-        print("INSIDE MAKE_KERNEL_RENDER")
         from triton.runtime.jit import JITFunction # type: ignore
         from .select_algorithm import PartialRender
         kernel, configs, restore_value_args, reset_to_zero_args = self.get_kernel_and_metadata()
@@ -6911,7 +6924,6 @@ class FusableUserDefinedTritonKernel(UserDefinedTritonKernel):
         # thus the kernel is of type JITFunction.
 
         assert isinstance(kernel, JITFunction)
-
 
         kernel_wrapper = UserDefinedTritonKernelWrapper(
             jit_kernel=kernel,
@@ -6952,9 +6964,39 @@ class FusableUserDefinedTritonKernel(UserDefinedTritonKernel):
 
     def get_read_writes(self) -> dependencies.ReadWrites:
 
+        from torch._higher_order_ops.triton_kernel_wrap import generate_ttir, ttir_to_functions
+
         # TODO: Currently this is entirely hardcoded for our custom triton kernel.
         # This is where our (generic) analysis will take place. Probably the crux 
         # of thesis.
+
+        kernel, configs, restore_value_args, reset_to_zero_args = self.get_kernel_and_metadata()
+        for name in kernel.arg_names:
+            print(name)
+        ttir_module, ordered_tensor_names = generate_ttir(
+            kernel, 
+            self.original_kernel_args,
+            {}  # tma_descriptor_metadata 
+        )
+
+        print(f"{ttir_module=}")
+        print(f"{ordered_tensor_names=}")
+
+        functions = ttir_to_functions(ttir_module)
+
+        kernel_name = next(iter(functions.keys()))
+        ops = functions[kernel_name]
+
+        for intermediate, op_list in ops.items():
+            print(f"\nIntermediate {intermediate}:")
+            for op in op_list:
+                print(f"  Op: {op.name}")
+                print(f"    Args: {op.args}")
+                print(f"    Returns: {op.ret}")
+                if op.fn_call_name:
+                    print(f"    Calls: {op.fn_call_name}")
+                if op.is_pure:
+                    print(f"    Pure: {op.is_pure}")
 
 
         input_buf = self.inputs[0] # buf0 - from nop
@@ -6971,7 +7013,9 @@ class FusableUserDefinedTritonKernel(UserDefinedTritonKernel):
         index_expr = layout.stride[0] * d0 + d1
         var_names = (d0, d1)
         size = tuple(layout.size)
-        
+
+        print(f"BLAH BLAH\n{input_buf=}\n{mutated_buf=}\n{output_buf}\n{layout=}{index_expr=}\n{var_names=}\n{size=}")
+
         reads = OrderedSet([
             dependencies.MemoryDep(
                 name=input_buf.get_name(),  # buf0
@@ -6981,7 +7025,7 @@ class FusableUserDefinedTritonKernel(UserDefinedTritonKernel):
                 mode=None
             ),
             dependencies.MemoryDep(
-                name=mutated_buf.get_name(),  # buf1
+                name=mutated_buf.get_name(),  # buf1 - reading before mutation
                 index=index_expr,
                 var_names=var_names,
                 size=size,

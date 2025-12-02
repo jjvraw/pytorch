@@ -386,11 +386,14 @@ def generate_ttir(
             if hasattr(triton.runtime.jit, "create_specialize_impl"):
                 try:
                     # Latest versions of Triton take specialize_extra as an arg to create_specialize_impl
+                    print("PATH 1")
                     specialize_impl = triton.runtime.jit.create_specialize_impl(
                         specialize_extra=backend.get_arg_specialization
                     )
                 except TypeError:  # Unknown arg `specialize_extra`
                     # Older versions of Triton take specialize_extra as an arg to specialize_impl
+
+                    print("PATH 2")
                     specialize_impl = functools.partial(
                         triton.runtime.jit.create_specialize_impl(),
                         specialize_extra=backend.get_arg_specialization,
@@ -398,6 +401,8 @@ def generate_ttir(
             else:
                 from triton.runtime.jit import specialize_impl as specialize_impl_orig
 
+
+                print("PATH 3")
                 specialize_impl = functools.partial(
                     specialize_impl_orig,
                     specialize_extra=backend.get_arg_specialization,

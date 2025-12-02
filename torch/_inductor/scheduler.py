@@ -1172,21 +1172,13 @@ class FusableUserDefinedKernelSchedulerNode(BaseSchedulerNode):
         layout = mutated_buf.get_layout()
         self._sizes = (tuple(layout.size), ())
 
-        print(f"{self._sizes=}")
-
-
         device = self.node.get_device_or_error() #type: ignore
         group_fn = self.scheduler.get_backend(device).group_fn
         self.group = (device, group_fn(self._sizes))
 
-        print(f"{self.group=}")
-
         read_writes = self.node.get_read_writes() #type: ignore
-        print(f"{read_writes.reads=}")
-        print(f"{read_writes.writes=}")
         
         self.set_read_writes(read_writes)
-        print(f"{self.unmet_dependencies=}")
 
 
     def get_ranges(self) -> Sequence[Sequence[sympy.Expr]]:
@@ -3717,7 +3709,6 @@ class Scheduler:
             resolve_pending_fusions(node1, node2)
             node1 = self.get_fused_node(node1)
             node2 = self.get_fused_node(node2)
-            print(node1, node2, "inside can_fuse")
 
             if self.can_fuse(
                 node1, node2, is_reorder_round
@@ -3842,7 +3833,6 @@ class Scheduler:
             for buf in node.used_buffer_names():
                 buffer_names_grouping[buf].append(node)
 
-        print(f"{buffer_names_grouping=}")
 
         for node_grouping in buffer_names_grouping.values():
             check_all_pairs(node_grouping)
@@ -4318,7 +4308,6 @@ class Scheduler:
         single fused node.
         """
 
-        print(f"inside can_fuse {node1=}, {node2=}")
         if node1 is node2:
             return False
 
@@ -4422,11 +4411,9 @@ class Scheduler:
         # if (nodeX.is_template() or nodeX.is_fusable_user_triton()) ...
         # and fall under the epilogue/prologue fusion conditions above.
         if node1.is_fusable_user_triton():
-            print("user kernel is producer")
             pass
 
         if node2.is_fusable_user_triton():
-            print("user kernel is consumer")
             pass
 
         if (node1.get_buffer_names() & V.graph.no_fuse_buffer_names) or (
@@ -4509,6 +4496,7 @@ class Scheduler:
             )
             if remaining:
                 for rd in remaining:
+                    print("A" * 1000, node2.get_template_node())
                     if self.fusable_read_and_write(rd, cd):
                         remaining.remove(rd)  # noqa: B909
 
@@ -5592,7 +5580,6 @@ class Scheduler:
                 self.codegen_extern_call(node)
             elif node.is_fusable_user_triton():
                 node = typing.cast(FusableUserDefinedKernelSchedulerNode, node)
-                print(type(self.get_backend(device)))
                 self.get_backend(device).codegen_fusable_user_defined_triton_kernel(node) # type: ignore
             elif node.is_foreach():
                 node = typing.cast(ForeachKernelSchedulerNode, node)
