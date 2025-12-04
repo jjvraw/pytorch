@@ -6866,12 +6866,14 @@ class UserDefinedTritonKernel(ExternKernel):
         ]
 
         from torch._higher_order_ops.triton_kernel_wrap import identify_mutated_tensors
+        print(type(grid))
+        print(grid)
 
         autotuned_kwargs = configs[0].kwargs if len(configs) > 0 else {}
         self.mutable_args = [
             kernel_args[key]
             for key in identify_mutated_tensors(
-                kernel, {**kernel_args, **autotuned_kwargs}, tma_descriptor_metadata
+                kernel, {**kernel_args, **autotuned_kwargs}, tma_descriptor_metadata, grid=grid
             )
         ]
 
@@ -6971,32 +6973,32 @@ class FusableUserDefinedTritonKernel(UserDefinedTritonKernel):
         # of thesis.
 
         kernel, configs, restore_value_args, reset_to_zero_args = self.get_kernel_and_metadata()
-        for name in kernel.arg_names:
-            print(name)
+        # for name in kernel.arg_names:
+        #     print(name)
         ttir_module, ordered_tensor_names = generate_ttir(
             kernel, 
             self.original_kernel_args,
             {}  # tma_descriptor_metadata 
         )
 
-        print(f"{ttir_module=}")
-        print(f"{ordered_tensor_names=}")
+        # print(f"{ttir_module=}")
+        # print(f"{ordered_tensor_names=}")
 
         functions = ttir_to_functions(ttir_module)
 
         kernel_name = next(iter(functions.keys()))
         ops = functions[kernel_name]
 
-        for intermediate, op_list in ops.items():
-            print(f"\nIntermediate {intermediate}:")
-            for op in op_list:
-                print(f"  Op: {op.name}")
-                print(f"    Args: {op.args}")
-                print(f"    Returns: {op.ret}")
-                if op.fn_call_name:
-                    print(f"    Calls: {op.fn_call_name}")
-                if op.is_pure:
-                    print(f"    Pure: {op.is_pure}")
+        # for intermediate, op_list in ops.items():
+        #     print(f"\nIntermediate {intermediate}:")
+        #     for op in op_list:
+        #         print(f"  Op: {op.name}")
+        #         print(f"    Args: {op.args}")
+        #         print(f"    Returns: {op.ret}")
+        #         if op.fn_call_name:
+        #             print(f"    Calls: {op.fn_call_name}")
+        #         if op.is_pure:
+        #             print(f"    Pure: {op.is_pure}")
 
 
         input_buf = self.inputs[0] # buf0 - from nop
@@ -7010,11 +7012,11 @@ class FusableUserDefinedTritonKernel(UserDefinedTritonKernel):
         d1 = sympy.Symbol('d1', integer=True, nonnegative=True)
         
         layout = mutated_buf.get_layout()
-        index_expr = layout.stride[0] * d0 + d1
+        index_expr = 4096 * d0 + d1
         var_names = (d0, d1)
         size = tuple(layout.size)
 
-        print(f"BLAH BLAH\n{input_buf=}\n{mutated_buf=}\n{output_buf}\n{layout=}{index_expr=}\n{var_names=}\n{size=}")
+        # print(f"BLAH BLAH\n{input_buf=}\n{mutated_buf=}\n{output_buf}\n{layout=}{index_expr=}\n{var_names=}\n{size=}")
 
         reads = OrderedSet([
             dependencies.MemoryDep(

@@ -386,14 +386,14 @@ def generate_ttir(
             if hasattr(triton.runtime.jit, "create_specialize_impl"):
                 try:
                     # Latest versions of Triton take specialize_extra as an arg to create_specialize_impl
-                    print("PATH 1")
+                    # print("PATH 1")
                     specialize_impl = triton.runtime.jit.create_specialize_impl(
                         specialize_extra=backend.get_arg_specialization
                     )
                 except TypeError:  # Unknown arg `specialize_extra`
                     # Older versions of Triton take specialize_extra as an arg to specialize_impl
 
-                    print("PATH 2")
+                    # print("PATH 2")
                     specialize_impl = functools.partial(
                         triton.runtime.jit.create_specialize_impl(),
                         specialize_extra=backend.get_arg_specialization,
@@ -402,7 +402,7 @@ def generate_ttir(
                 from triton.runtime.jit import specialize_impl as specialize_impl_orig
 
 
-                print("PATH 3")
+                # print("PATH 3")
                 specialize_impl = functools.partial(
                     specialize_impl_orig,
                     specialize_extra=backend.get_arg_specialization,
@@ -924,6 +924,7 @@ def identify_mutated_tensors(
     kernel: "TritonKernelType",
     kwargs: dict[str, Any],
     tma_descriptor_metadata: TMADescriptorMetadata,
+    grid: Optional[list["TritonGridType"]] = None
 ) -> list[str]:
     """
     Given a triton kernel and the arguments for this kernel, this function
@@ -938,7 +939,6 @@ def identify_mutated_tensors(
         ttir_module, ordered_tensor_names = generate_ttir(
             kernel, kwargs, tma_descriptor_metadata
         )
-
         # extract functions from TTIR using MLIR bindings exposed by Triton code
         functions = ttir_to_functions(ttir_module)
 
@@ -953,6 +953,9 @@ def identify_mutated_tensors(
         get_tma_stores.reset()
         mutations = analyze_kernel_mutations(
             functions, kernel_name, len(ordered_tensor_names)
+        )
+        analyze_kernel_access_patterns(
+            functions, kernel_name, len(ordered_tensor_names), [256, 1, 1] 
         )
 
         return [
@@ -972,6 +975,73 @@ def identify_mutated_tensors(
                 for ret, ops in fn.items():
                     log.debug("%s\t=>\t%s", ret, ops)
         return [key for key, value in kwargs.items() if isinstance(value, Tensor)]
+
+
+def analyze_kernel_access_patterns(
+    functions: dict[str, dict[Intermediate, list[Op]]], fn_name: str, num_args: int, grid
+    ):
+
+    # why do we index into functions? does this imply that functions can have multiple calls to other kernels?
+    ops = functions[fn_name]
+    sym_meta = {}
+
+    assert grid is not None
+
+    def build_expr(node: Union[Intermediate, Param]):
+
+        if isinstance(node, Param):
+            return sympy.Symbol(f'p{node.idx}', integer=True)
+        elif isinstance(node, Intermediate):
+            op_list = ops.get(node)
+
+            assert op_list is not None
+            op = op_list[0]
+
+            if op.name == 'tt.addptr':
+                ptr = build_expr(op.args[0])
+                offset = build_expr(op.args[1])
+                return ptr + offset
+            elif op.name == "arith.addi":
+                lhs = build_expr(op.args[0])
+                rhs = build_expr(op.args[1])
+                return lhs + rhs
+            elif op.name == "arith.muli":
+                lhs = build_expr(op.args[0])
+                rhs = build_expr(op.args[1])
+                return lhs * rhs
+            elif op.name == "tt.splat":
+                return build_expr(op.args[0])
+            elif op.name == "tt.get_program_id":
+                sym = sympy.Symbol(f'd{len(sym_meta) + 1}', integer=True, nonnegative=True)
+                axis = 0
+                end = grid[axis]
+                sym_meta[sym] = end
+                return sym
+            elif op.name == "tt.make_range":
+                sym = sympy.Symbol(f'd{len(sym_meta) + 1}', integer=True, nonnegative=True)
+                end = 1024
+                sym_meta[sym] = end
+                return sym
+            elif op.name == "arith.constant":
+                return sympy.Integer(1026)
+
+    for result, op_list in ops.items():
+        for op in op_list:
+            # print(f"  {result} = {op.name}({op.args})")
+            if op.name == 'tt.load':
+                # print(f"  {result} = {op.name}({op.args})")
+                ptr = build_expr(op.args[0])
+                # mask = (op.args[1])
+                print(f"{ptr=}")
+                print(sym_meta)
+            # if op.name == 'tt.store':
+            #     ptr = build_expr(op.args[0])
+            #     # mask = (op.args[1])
+            #     print(f"{ptr=}")
+            #     print(sym_meta)
+            #     # TODO: For now we will just consider `store`. 
+            #     # looking at 
+            #     print(op)
 
 
 ###############################################################################

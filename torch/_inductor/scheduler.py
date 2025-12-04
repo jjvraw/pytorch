@@ -4496,7 +4496,6 @@ class Scheduler:
             )
             if remaining:
                 for rd in remaining:
-                    print("A" * 1000, node2.get_template_node())
                     if self.fusable_read_and_write(rd, cd):
                         remaining.remove(rd)  # noqa: B909
 
