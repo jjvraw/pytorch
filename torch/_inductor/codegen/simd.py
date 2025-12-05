@@ -48,7 +48,7 @@ from ..optimize_indexing import indexing_dtype_strength_reduction
 from ..runtime.coordinate_descent_tuner import CoordescTuner
 from ..runtime.hints import DeviceProperties
 from ..runtime.runtime_utils import green_text, last_power_of_2, yellow_text
-from ..scheduler import BaseSchedulerNode, BaseScheduling, WhyNoFuse
+from ..scheduler import BaseSchedulerNode, BaseScheduling, FusableUserDefinedKernelSchedulerNode, WhyNoFuse
 from ..utils import (
     cache_property_on_self,
     expr_fits_within_32bit,
@@ -1814,6 +1814,11 @@ class SIMDScheduling(BaseScheduling):
         if len(nodes) == 0:
             return
 
+        user_kernel_nodes = [n for n in nodes if isinstance(n, FusableUserDefinedKernelSchedulerNode)]
+
+        # if user_kernel_nodes:
+        #     return self.codegen_user_defined_kernel_fusion(node, user_kernel_nodes, nodes)
+
         if torch._inductor.config.triton.coalesce_tiling_analysis:
             if len(nodes) != len(node.get_nodes()):
                 assert self.scheduler
@@ -1823,6 +1828,37 @@ class SIMDScheduling(BaseScheduling):
             coalesce_analysis = None
 
         return self._codegen_nodes(nodes, coalesce_analysis)  # type: ignore[arg-type]
+
+    def codegen_user_defined_kernel_fusion(self, fused_node, user_kernel_nodes, all_nodes):
+        print("=" * 5, "CUSTOM CODEGEN PATH FOR USER KERNEL", "=" * 5)
+
+
+    def emit_fused_kernel_call(self, kernel_name, user_kernel_node, consumer_nodes):
+        # choose 1st read as input, 1st write as output for Phase 1
+        rd = next(iter(user_kernel_node.read_writes.reads)).name
+        wr = next(iter(user_kernel_node.read_writes.writes)).name
+
+        in_name = rd
+        out_name = wr
+
+        # derive shape/stride/dtype/numel
+        out_layout = V.graph.get_buffer(out_name).get_layout()
+        out_size = tuple(out_layout.size)
+        out_stride = tuple(out_layout.stride)
+        out_dtype = V.graph.get_dtype(out_name)
+        numel = V.graph.sizevars.size_hint(V.graph.get_numel(out_name))
+
+        V.graph.wrapper_code.writeline(
+            f"{out_name} = empty_strided_cuda({out_size}, {out_stride}, {out_dtype!r})"
+        )
+
+        dev = V.graph.get_current_device_or_throw()
+        V.graph.wrapper_code.writeline(f"stream0 = get_raw_stream({dev.index})")
+
+        # Your kernel ignores the xnumel arg and uses its baked constant; that's fine.
+        V.graph.wrapper_code.writeline(
+            f"{kernel_name}.run({in_name}, {out_name}, {numel}, stream=stream0)"
+        )
 
     @staticmethod
     def can_use_32bit_indexing(

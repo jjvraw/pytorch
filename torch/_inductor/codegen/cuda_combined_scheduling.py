@@ -3,11 +3,15 @@ from __future__ import annotations
 
 from typing import Any, Optional, TYPE_CHECKING, Union
 
+from torch._inductor.ir import FusableUserDefinedTritonKernel, IRNode, TensorBox
+
 from ..scheduler import (
     BaseSchedulerNode,
     BaseScheduling,
+    FusableUserDefinedKernelSchedulerNode,
     FusedSchedulerNode,
     Scheduler,
+    SchedulerBuffer,
     SchedulerNode,
 )
 from .cuda.cuda_cpp_scheduling import CUDACPPScheduling
@@ -93,6 +97,121 @@ class CUDACombinedScheduling(BaseScheduling):
         self, sizes: Sequence[Sequence[_IntLike]]
     ) -> tuple[tuple[_IntLike, ...], ...]:
         return self._triton_scheduling.group_fn(sizes)
+
+    def codegen_fusable_user_defined_triton_kernel(
+        self,
+        scheduler_node
+    ):
+        """
+        NOTE: This is for a simple epilogue fusion (user-defined = producer, scheduler-node = consumer).
+        Two main goals, in order:
+            1. BUFFER MANAGEMENT: 
+                - Resolve intermediate buffers, 
+                - and correct input/output buffers of `FusedSchedulerNode`.
+            2. MERGE COMPUTATION:
+                - Combine the epilogue's computation into the user kernel's source code.
+        """
+        from ..virtualized import V
+
+        nodes = scheduler_node.get_nodes()
+
+        user_defined_scheduler_node = nodes[0]
+        assert isinstance(user_defined_scheduler_node, FusableUserDefinedKernelSchedulerNode)
+
+        iir_node = user_defined_scheduler_node.node
+        assert isinstance(iir_node, FusableUserDefinedTritonKernel)
+        assert iir_node is not None # For LSP
+
+        kernel_wrapper, render = iir_node.make_kernel_render()
+
+        # Remaning nodes are epilogue nodes
+        epilogue_nodes = [n for n in nodes[1:] if isinstance(n, SchedulerNode)]
+
+        # Triton kernels do not return an output, but rather mutate arguments.
+        # However, this is somewhat represented as an output in the dep-graph.
+
+        # We will work from the persepctive of the consumer (epilogue kernel), to avoid 
+        # changing dependencies of subeqeuent operations (that is, the subsequent to this fused kernel). 
+        # Thus, we will work backwards from the epilogue: 
+        #       (1) get the ouput buffer of the subsequent.
+        #       (2) redirect the user-kernel with (1)'s buffer.
+        #           this is apart of the mutated buffers of the user-kernels.
+        #       (3) mark intermediate buffers as removed, so they're not allocated.
+
+        user_kernel_output_buf = user_defined_scheduler_node.get_outputs()[0]
+        assert isinstance(user_kernel_output_buf, SchedulerBuffer), f"{type(user_kernel_output_buf)}"
+
+        # Get mutable arguments of user-kernel. These are in the form of TensorBox.
+        # For our example we only have one argument/buffer that is mutated.
+        assert len(iir_node.mutable_args) == 1
+        mutated_buffer_name = iir_node.mutable_args[0].get_name()
+        assert isinstance(iir_node.mutable_args[0], TensorBox)
+
+        # Get epilogue SchedulerBuffer.
+        epilogue_output_buf = epilogue_nodes[0].get_outputs()[0]
+        epilogue_output_name = epilogue_output_buf.get_name()
+
+        # Replace in kwargs.
+        epilogue_ir_buf = epilogue_output_buf.node
+        # TODO: I dont like the way this is done. Perhaps we add some mapping to the iir_node
+        #       during initialisation or analysis.
+        for key, value in iir_node.kwargs.items():
+            # TODO: Is there a case where an IRNode for Triton kernel will not have this implemented?
+            if isinstance(value, IRNode) and value.get_name() == mutated_buffer_name:
+                iir_node.kwargs[key] = epilogue_ir_buf
+                break
+        else:
+            assert False
+
+        # Mark intermediate buffers as removed
+        kernel_wrapper.removed_buffers.add(mutated_buffer_name)  # buf1
+        kernel_wrapper.removed_buffers.add(user_kernel_output_buf.get_name())  # buf2
+
+        # Currently, the render() function and hooks are hardcoded for the
+        # specific GeLU + scale example. A general implementation would need
+        # to introspect both the user-defined and epilogue bodies and codegen the
+        # appropriate Triton code.
+        with kernel_wrapper:
+            partial_code = render()
+            partial_code.finalize_hook("<KERNEL_BODY>")
+            partial_code.finalize_hook("<EPILOGUE_FUSION>")
+
+            src_code = partial_code.code
+
+            # print(src_code)
+
+        # kernel_wrapper.jit_kernel.__dict__['src'] = src_code
+        # kernel_wrapper.jit_kernel.src = src_code
+        wrapper = V.graph.wrapper_code
+        user_kernel = kernel_wrapper.user_defined_kernel
+
+        (
+            kernel_name,
+            triton_meta,
+            extra_launch_args,
+        ) = wrapper.define_user_defined_triton_kernel(
+            kernel_wrapper.jit_kernel,
+            kernel_wrapper.configs,
+            user_kernel.kwargs,
+            kernel_wrapper.restore_value_args,
+            kernel_wrapper.reset_to_zero_args,
+            user_kernel.grid,
+            src_code # TODO: CHECK THIS LOGIC !!!!
+        )
+
+        kernel_wrapper.kernel_name = kernel_name
+        kernel_wrapper.extra_launch_args = extra_launch_args
+
+        with V.set_kernel_handler(kernel_wrapper):
+            for node in scheduler_node.get_nodes():
+                node.mark_run()
+
+        # kernel_wrapper.call_kernel(kernel_name, scheduler_node)
+        kernel_wrapper.call_kernel(kernel_name)
+
+        V.graph.removed_buffers |= kernel_wrapper.removed_buffers
+        V.graph.inplaced_to_remove |= kernel_wrapper.inplaced_to_remove
+        self.free_buffers_in_scheduler()
 
     def codegen_template(
         self,

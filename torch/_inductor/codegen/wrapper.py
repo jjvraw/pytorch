@@ -2356,6 +2356,7 @@ class PythonWrapperCodegen(CodeGen):
         restore_value_args,
         reset_to_zero_args,
         grids: list[list[Union[int, sympy.Expr]]],
+        modified_src: Union[None, str] = None
     ):
         from ..runtime.triton_heuristics import (
             config_to_dict,
@@ -2597,7 +2598,12 @@ class PythonWrapperCodegen(CodeGen):
             @triton.jit
             """
         )
-        kernel_src = user_defined_triton_kernel_transitive_closure_source_code(kernel)
+
+        if modified_src:
+            kernel_src = modified_src
+        else: 
+            kernel_src = user_defined_triton_kernel_transitive_closure_source_code(kernel)
+
         if config.triton.unique_user_kernel_names:
             # We replace the original_name with the unique name.
             kernel_src = kernel_src.replace(f"def {original_name}(", f"def {name}(")

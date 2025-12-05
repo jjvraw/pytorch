@@ -148,6 +148,7 @@ class KernelSideTable:
     id_to_kernel: dict[int, "TritonKernelType"] = {}
     kernel_to_id: dict["TritonKernelType", int] = {}
     constant_args: dict[int, dict[str, Any]] = {}
+    fusion_metadata: dict[int, dict[str, Any]] = {}
     lock = threading.Lock()
 
     # Returns index on the table
@@ -181,12 +182,20 @@ class KernelSideTable:
         assert idx in self.constant_args
         return self.constant_args[idx]
 
+    def get_fusion_metadata(self, idx: int) -> dict[str, Any]:
+        return self.fusion_metadata.get(idx, {})
+
+    def set_fusion_metadata(self, kernel_idx: int, extras: dict[str, Any]) -> None:
+        with self.lock:
+            self.fusion_metadata[kernel_idx] = dict(extras)
+
     # Resets the table (only meant to be used in unit tests)
     # This is only safe assuming single threaded execution
     def reset_table(self) -> None:
         self.id_to_kernel = {}
         self.kernel_to_id = {}
         self.constant_args = {}
+        self.fusion_metadata = {}
 
 
 kernel_side_table = KernelSideTable()
@@ -986,6 +995,9 @@ def identify_mutated_tensors(
         mutations = analyze_kernel_mutations(
             functions, kernel_name, len(ordered_arg_names)
         )
+        # analyze_kernel_access_patterns(
+        #     functions, kernel_name, len(ordered_tensor_names), [256, 1, 1] 
+        # )
 
         return [
             ordered_arg_names[i]
@@ -1012,6 +1024,72 @@ def identify_mutated_tensors(
             for key, value in kwargs.items()
             if isinstance(value, (Tensor, torch._inductor.ir.TensorBox))
         ]
+
+def analyze_kernel_access_patterns(
+    functions: dict[str, dict[Intermediate, list[Op]]], fn_name: str, num_args: int, grid
+    ):
+
+    # why do we index into functions? does this imply that functions can have multiple calls to other kernels?
+    ops = functions[fn_name]
+    sym_meta = {}
+
+    assert grid is not None
+
+    def build_expr(node: Union[Intermediate, Param]):
+
+        if isinstance(node, Param):
+            return sympy.Symbol(f'p{node.idx}', integer=True)
+        elif isinstance(node, Intermediate):
+            op_list = ops.get(node)
+
+            assert op_list is not None
+            op = op_list[0]
+
+            if op.name == 'tt.addptr':
+                ptr = build_expr(op.args[0])
+                offset = build_expr(op.args[1])
+                return ptr + offset
+            elif op.name == "arith.addi":
+                lhs = build_expr(op.args[0])
+                rhs = build_expr(op.args[1])
+                return lhs + rhs
+            elif op.name == "arith.muli":
+                lhs = build_expr(op.args[0])
+                rhs = build_expr(op.args[1])
+                return lhs * rhs
+            elif op.name == "tt.splat":
+                return build_expr(op.args[0])
+            elif op.name == "tt.get_program_id":
+                sym = sympy.Symbol(f'd{len(sym_meta) + 1}', integer=True, nonnegative=True)
+                axis = 0
+                end = grid[axis]
+                sym_meta[sym] = end
+                return sym
+            elif op.name == "tt.make_range":
+                sym = sympy.Symbol(f'd{len(sym_meta) + 1}', integer=True, nonnegative=True)
+                end = 1024
+                sym_meta[sym] = end
+                return sym
+            elif op.name == "arith.constant":
+                return sympy.Integer(1026)
+
+    for result, op_list in ops.items():
+        for op in op_list:
+            # print(f"  {result} = {op.name}({op.args})")
+            if op.name == 'tt.load':
+                # print(f"  {result} = {op.name}({op.args})")
+                ptr = build_expr(op.args[0])
+                # mask = (op.args[1])
+                print(f"{ptr=}")
+                print(sym_meta)
+            # if op.name == 'tt.store':
+            #     ptr = build_expr(op.args[0])
+            #     # mask = (op.args[1])
+            #     print(f"{ptr=}")
+            #     print(sym_meta)
+            #     # TODO: For now we will just consider `store`. 
+            #     # looking at 
+            #     print(op)
 
 
 ###############################################################################
@@ -1244,6 +1322,7 @@ def get_mutated_tensors(
 ) -> list[str]:
     kernel = kernel_side_table.get_kernel(kernel_idx)
     constant_args = kernel_side_table.get_constant_args(constant_args_idx)
+    print("we get here, `get_mutated_tensors`")
     return identify_mutated_tensors(
         kernel, {**kwargs, **constant_args}, tma_descriptor_metadata
     )
@@ -1638,6 +1717,7 @@ class TritonHOPifier:
             kernel=variable.kernel,
             kernel_idx=variable.kernel_idx,
             grid=args[0],
+            attempt_fusion=variable.attempt_fusion
         )
 
     def call_run(
@@ -1654,7 +1734,7 @@ class TritonHOPifier:
         # rewrite kernel.run(*args, grid=grid) to kernel[grid](*args)
         return self.call_triton_kernel(
             type(variable)(
-                kernel=variable.kernel, kernel_idx=variable.kernel_idx, grid=grid
+                kernel=variable.kernel, kernel_idx=variable.kernel_idx, grid=grid, attempt_fusion=getattr(variable, "attempt_fusion", False)
             ),
             args,
             kwargs,
@@ -1756,7 +1836,7 @@ class TritonHOPifier:
             )(iter_kernel)
             # create a new variable to contain the new (wrapped) kernel;
             # skip kernel_idx to get a new record in the kernel side table
-            new_var = type(variable)(new_kernel, None, variable.grid)
+            new_var = type(variable)(new_kernel, None, variable.grid, attempt_fusion=getattr(variable, "attempt_fusion", False))
             return self.call_triton_kernel(new_var, args, kwargs, tx)
 
         SPECIAL_CONFIG_NAMES = {
@@ -1801,7 +1881,7 @@ class TritonHOPifier:
 
             # create a new variable to contain the new (wrapped) kernel;
             # skip kernel_idx to get a new record in the kernel side table
-            new_var = type(variable)(new_kernel, None, variable.grid)
+            new_var = type(variable)(new_kernel, None, variable.grid, attempt_fusion=getattr(variable, "attempt_fusion", False))
             return self.call_triton_kernel(new_var, args, kwargs, tx)
 
         if isinstance(variable.kernel, Autotuner):
@@ -1839,7 +1919,7 @@ class TritonHOPifier:
                     new_kernel = autotune(
                         configs=new_configs, prune_configs_by=prune_configs_by, key=[]
                     )(variable.kernel.fn)
-                    new_var = type(variable)(new_kernel, None, variable.grid)
+                    new_var = type(variable)(new_kernel, None, variable.grid, attempt_fusion=getattr(variable, "attempt_fusion", False))
                     return self.call_triton_kernel(new_var, args, kwargs, tx)
 
         # These are the default values in upstream Triton
@@ -1899,7 +1979,7 @@ class TritonHOPifier:
             new_kernel = autotune(configs=pruned_configs, key=[])(variable.kernel.fn)
             # create a new variable to contain the new (wrapped) kernel;
             # skip kernel_idx to get a new record in the kernel side table
-            new_var = type(variable)(new_kernel, None, variable.grid)
+            new_var = type(variable)(new_kernel, None, variable.grid, attempt_fusion=getattr(variable, "attempt_fusion", False))
             return self.call_triton_kernel(new_var, args, kwargs, tx)
 
         # Both for grid's meta as well as for the kernel, we need combined
@@ -2072,6 +2152,11 @@ class TracingTritonHOPifier(TritonHOPifier):
 
         graphable_args, constant_args_idx = self.store_non_graphable_args(combined_args)
 
+        kernel_side_table.set_fusion_metadata(
+            variable.kernel_idx,
+            {"attempt_fusion": bool(getattr(variable, "attempt_fusion", False))},
+        )
+
         assert isinstance(variable.kernel_idx, int)
         return triton_kernel_wrapper_mutation(
             kernel_idx=variable.kernel_idx,
@@ -2097,10 +2182,12 @@ class TraceableTritonKernelWrapper:
         kernel: "TritonKernelType",
         kernel_idx: Optional[int],
         grid: Optional["TritonGridType"],
+        attempt_fusion: bool = False
     ) -> None:
         # pyrefly: ignore [bad-assignment]
         self.kernel = None
         self.grid = None
+        self.attempt_fusion = attempt_fusion
         tracing_triton_hopifier_singleton.init_variable(self, kernel, kernel_idx, grid)
         assert self.kernel is not None
 

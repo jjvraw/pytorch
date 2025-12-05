@@ -7297,12 +7297,22 @@ def triton_kernel_wrap_(
     from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
 
     constant_args = kernel_side_table.get_constant_args(constant_args_idx)
-    ir.UserDefinedTritonKernel(
-        kernel_idx=kernel_idx,
-        grid=grid,
-        tma_descriptor_metadata=tma_descriptor_metadata,
-        kernel_args={**kwargs, **constant_args},
-    )
+    attempt_fusion = kernel_side_table.get_fusion_metadata(kernel_idx).get("attempt_fusion", False)
+
+    if not attempt_fusion:
+        ir.UserDefinedTritonKernel(
+            kernel_idx=kernel_idx,
+            grid=grid,
+            tma_descriptor_metadata=tma_descriptor_metadata,
+            kernel_args={**kwargs, **constant_args},
+        )
+    else:
+        ir.FusableUserDefinedTritonKernel(
+            kernel_idx=kernel_idx,
+            grid=grid,
+            tma_descriptor_metadata=tma_descriptor_metadata,
+            kernel_args={**kwargs, **constant_args},
+        )
     return {key: val for key, val in kwargs.items() if isinstance(val, TensorBox)}
 
 
