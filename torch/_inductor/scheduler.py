@@ -98,6 +98,14 @@ _T = TypeVar("_T")
 _P = ParamSpec("_P")
 
 
+@dataclasses.dataclass
+class TritonBinding:
+    buf_to_varname: dict[str, str]
+    store_locs: dict[str, int]
+    buf_to_access: dict[str, tuple[str, str]]
+    output_buf_to_argname: dict[str, str]
+
+
 class MixOrderReduction:
     """
     This class contains utility functions to decide if we should fuse reductions
@@ -767,6 +775,9 @@ class BaseSchedulerNode:
     def is_extern(self) -> bool:
         return False
 
+    def is_fusable_user_triton(self) -> bool:
+        return False
+
     def is_foreach(self) -> bool:
         return False
 
@@ -1426,6 +1437,96 @@ def _prune_redundant_deps(
         node.set_read_writes(node.read_writes.remove_reads(deps_to_prune))
 
 
+class FusableUserDefinedKernelSchedulerNode(BaseSchedulerNode):
+    def __init__(self, scheduler: Scheduler, node: ir.Operation):
+        super().__init__(scheduler)
+        self._init_from_node(node)
+        self._compute_attrs()
+        self._body = self._create_dummy_body()
+
+    def _create_dummy_body(self):
+        class DummyBody:
+            op_counts = {
+                "mul": 2,  # x * 1.702, x * sigmoid_val
+                "exp": 1,  # exp(-sigmoid_input)
+                "add": 1,  # 1.0 + exp(...)
+                "div": 1,  # 1.0 / (...)
+            }
+
+            def get_reduction_type(self):
+                return None
+
+            def get_reduction_size(self):
+                return []
+
+        return DummyBody()
+
+    def _compute_attrs(self) -> None:
+        assert isinstance(self.node, ir.FusableUserDefinedTritonKernel)
+
+        # Get non-canonicalised sizes
+        mutated_buf = self.node.mutable_args[0]  # type: ignore
+        layout = mutated_buf.get_layout()
+        self._sizes = (tuple(layout.size), ())
+
+        device = self.node.get_device_or_error()  # type: ignore
+        group_fn = self.scheduler.get_backend(device).group_fn
+        self.group = (device, group_fn(self._sizes))
+
+        read_writes = self.node.get_read_writes()  # type: ignore
+
+        self.set_read_writes(read_writes)
+
+    def get_ranges(self) -> Sequence[Sequence[sympy.Expr]]:
+        return self._sizes
+
+    def pointwise_or_reduction_read_writes(
+        self, pointwise: bool = True
+    ) -> dependencies.ReadWrites:
+        # TODO:
+        keep_sizes, ignore_sizes = self._sizes if pointwise else reversed(self._sizes)
+
+        # For user-defined kernels, we don't have a symbolic body to analyze,
+        # so we manually construct the ReadWrites with range_vars
+        full_rw = self.node.get_read_writes()  # type: ignore
+
+        # Create range variables for the dimensions we're keeping
+        range_vars = [
+            sympy.Symbol(f"d{i}", integer=True) for i in range(len(keep_sizes))
+        ]
+
+        # Return ReadWrites with the range_vars attribute
+        return dependencies.ReadWrites(
+            reads=full_rw.reads,
+            writes=full_rw.writes,
+            index_exprs=full_rw.index_exprs
+            if hasattr(full_rw, "index_exprs")
+            else OrderedSet(),
+            range_vars=range_vars,
+            var_ranges={var: size for var, size in zip(range_vars, keep_sizes)},
+        )
+
+    def is_extern(self):
+        # TODO: Currently we'll mark keep this as False until we see problems.
+        # (since we still rely a lot of ExternKernel functionality)
+        return super().is_extern()
+
+    def add_fake_dep(self, dep: Dep) -> None:
+        return
+        # if isinstance(dep, StarDep):
+        #     has_memory_dep = any(
+        #         isinstance(d, MemoryDep) and d.name == dep.name
+        #         for d in self.read_writes.reads
+        #     )
+        #     if has_memory_dep:
+        #         return
+        #
+        # super().add_fake_dep(dep)
+
+    def is_fusable_user_triton(self) -> bool:
+        return True
+
+
 class ExternKernelSchedulerNode(BaseSchedulerNode):
     def __init__(self, scheduler: Scheduler, node: ir.Operation) -> None:
         super().__init__(scheduler)
@@ -1709,6 +1810,8 @@ class SchedulerNode(BaseSchedulerNode):
                         the index variables for each dimension of the computation.
         """
         var_ranges = self.ranges_from_index_vars(index_vars)
+        # print(V.get_ops_handler())
+        # print(V.kernel)
         try:
             with (
                 V.set_ops_handler(SimplifyIndexing(V.get_ops_handler(), var_ranges)),
@@ -1833,13 +1936,17 @@ class FusedSchedulerNode(BaseSchedulerNode):
     """
 
     snodes: list[BaseSchedulerNode]
+    triton_binding: Optional[TritonBinding] = None
 
     @classmethod
     def fuse(
         cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> FusedSchedulerNode:
         assert node1.scheduler is node2.scheduler
-        assert isinstance(node1, (SchedulerNode, FusedSchedulerNode))
+        assert isinstance(
+            node1,
+            (SchedulerNode, FusedSchedulerNode, FusableUserDefinedKernelSchedulerNode),
+        )
         if node1.is_template() and isinstance(node2, ExternKernelSchedulerNode):
             # Fuse multi outputs template and its outputs
             #   * Node1 has memorydep of MultiOutput in reads
@@ -1863,6 +1970,67 @@ class FusedSchedulerNode(BaseSchedulerNode):
                     ),
                 ]
             )
+        elif node1.is_fusable_user_triton() and isinstance(node2, SchedulerNode):
+            node1_write_names = {
+                node1.scheduler.mutation_real_name.get(dep.name, dep.name): dep
+                for dep in node1.read_writes.writes
+            }
+            node2_read_names = OrderedSet(
+                [
+                    node2.scheduler.mutation_real_name.get(dep.name, dep.name)
+                    for dep in node2.read_writes.reads
+                ]
+            )
+            intermediate_buffers = node1_write_names.keys() & node2_read_names
+            assert len(intermediate_buffers) == 1, "Only single buffer fusion supported"
+
+            # Intermediate depedencies represent outputs from node1, which are
+            # intermediate stores within the user's kernel.
+            buf_to_varname = {
+                name: node1_write_names[name].operand_name
+                for name in intermediate_buffers
+            }
+            store_locs = {
+                name: node1_write_names[name].loc for name in intermediate_buffers
+            }
+            # print(f"{buf_to_varname=}")
+            # print(f"{store_locs=}")
+
+            # We now need to store the new writing pattern for the correct buffer.
+            # That is the output buffer of the epilogue.
+            # For now we are just working with a pointwise/bijective epilogue kernel.
+            write_dep = next(iter(node1.read_writes.writes))
+            write_access = write_dep.index_str
+            mask = write_dep.mask
+            for sym, triton_expr in node1.node.sym_meta.items():
+                write_access = write_access.replace(str(sym), f"{triton_expr}")
+                mask = str(mask).replace(str(sym), f"{triton_expr}")
+
+            buf_to_access = {}
+            intermediate_buf = next(iter(intermediate_buffers))
+
+            output_buf_to_argname = {}
+            for dep in node2.read_writes.writes:
+                epilogue_output_buf = node2.scheduler.mutation_real_name.get(
+                    dep.name, dep.name
+                )
+                buf_to_access[epilogue_output_buf] = (write_access, mask)
+
+                # Single buffer case - map to the one intermediate buffer
+                user_output_argname = node1_write_names[intermediate_buf].arg_name
+                output_buf_to_argname[epilogue_output_buf] = user_output_argname
+
+            # print(f"{output_buf_to_argname=}")
+            nodes = list(itertools.chain(node1.get_nodes(), node2.get_nodes()))
+            fused_node = cls(node1.scheduler, nodes)
+            fused_node.triton_binding = TritonBinding(
+                buf_to_varname=buf_to_varname,
+                store_locs=store_locs,
+                buf_to_access=buf_to_access,
+                output_buf_to_argname=output_buf_to_argname,
+            )
+
+            return fused_node
         else:
             assert isinstance(node2, (SchedulerNode, FusedSchedulerNode))
         nodes = list(itertools.chain(node1.get_nodes(), node2.get_nodes()))
@@ -2022,6 +2190,10 @@ class FusedSchedulerNode(BaseSchedulerNode):
     @cache_on_self
     def is_template(self) -> bool:
         return any(x.is_template() for x in self.snodes)
+
+    @cache_on_self
+    def is_fusable_user_triton(self) -> bool:
+        return any(x.is_fusable_user_triton() for x in self.snodes)
 
     @cache_on_self
     def get_template_node(self) -> Optional[ir.TemplateBuffer]:
@@ -3053,6 +3225,8 @@ class Scheduler:
             return NopKernelSchedulerNode(self, node)
         elif isinstance(node, (ir.ComputedBuffer, ir.TemplateBuffer)):
             return SchedulerNode(self, node)
+        elif isinstance(node, ir.FusableUserDefinedTritonKernel):
+            return FusableUserDefinedKernelSchedulerNode(self, node)
         elif isinstance(node, ir.ExternKernel):
             return ExternKernelSchedulerNode(self, node)
         else:
@@ -4238,6 +4412,7 @@ class Scheduler:
             resolve_pending_fusions(node1, node2)
             node1 = self.get_fused_node(node1)
             node2 = self.get_fused_node(node2)
+            # print("Possible fusions", node1, node2)
 
             if self.can_fuse(
                 node1, node2, is_reorder_round
@@ -4347,6 +4522,12 @@ class Scheduler:
                         continue
                     seen.add(key)
 
+                    # print(
+                    #     "Can fuse",
+                    #     node1,
+                    #     node2,
+                    #     self.can_fuse(node1, node2, is_reorder_round),
+                    # )
                     if self.can_fuse(node1, node2, is_reorder_round):
                         possible_fusions.append(key)
                     elif (node2.is_template() or node2.is_foreach()) and self.can_fuse(
@@ -4859,7 +5040,14 @@ class Scheduler:
         Is this node unfusable under any conditions.
         """
         return (
-            isinstance(node, (ExternKernelSchedulerNode, NopKernelSchedulerNode))
+            isinstance(
+                node,
+                (
+                    ExternKernelSchedulerNode,
+                    NopKernelSchedulerNode,
+                ),
+            )
+            # or node.is_fusable_user_triton() # TODO: Remove once codegen via `SIMDScheduling.codegen_user_defined..` isworking.
             and not node.is_template()
             and not is_output_of_multi_outputs_template(node.node)
         )
@@ -5137,6 +5325,16 @@ class Scheduler:
             why("template epilogue not satisfied")
             return False
 
+        # TODO: Early rejections for fusable user triton.
+        # Perhaps we can do something like
+        # if (nodeX.is_template() or nodeX.is_fusable_user_triton()) ...
+        # and fall under the epilogue/prologue fusion conditions above.
+        if node1.is_fusable_user_triton():
+            pass
+
+        if node2.is_fusable_user_triton():
+            pass
+
         if (node1.get_buffer_names() & V.graph.no_fuse_buffer_names) or (
             node2.get_buffer_names() & V.graph.no_fuse_buffer_names
         ):
@@ -5153,6 +5351,10 @@ class Scheduler:
             node1, node2, allow_mix_order_reduction=allow_mix_order_reduction
         )
         assert isinstance(shared_data_score, int)
+
+        # TODO[JJV]: There may be a better way here...
+        if node1.is_fusable_user_triton():
+            shared_data_score = 1
 
         if (
             can_reorder
@@ -5191,6 +5393,10 @@ class Scheduler:
 
         if not V.choices.can_fuse(self, node1, node2, shared_data_score):
             return False
+        # print(self.get_backend(device))
+
+        if node1.is_fusable_user_triton() or node2.is_fusable_user_triton():
+            return self.can_fuse_user_defined_triton(node1, node2)
 
         if node1.get_operation_names() & node2.ancestors:
             # node2 depends on node1 outputs
@@ -5218,6 +5424,11 @@ class Scheduler:
         why = WhyNoFuse(node1, node2)
         remaining_deps_by_name: dict[str, list[Dep]] = defaultdict(list)
 
+        # print(self.mutation_renames)
+        # print(self.mutation_real_name)
+
+        # Gather node2's unmet dependencies, group them by buffer name.
+        # Exclude ordering constraints, i.e. WeakDeps.
         for dep in node2.unmet_dependencies:
             name = self.mutation_renames.get(dep.name, dep.name)
             if isinstance(dep, WeakDep) and self.fusable_weak_dep(dep, node1, node2):
@@ -5341,6 +5552,12 @@ class Scheduler:
             ):
                 return True
         return False
+
+    def can_fuse_user_defined_triton(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> bool:
+        # TODO[JJV]
+        return True
 
     def dep_size_hint(self, dep: Dep, count_bytes: bool = True) -> int:
         return V.graph.get_dep_size_hint(dep, count_bytes)
@@ -6326,6 +6543,13 @@ class Scheduler:
             elif node.is_extern():
                 node = typing.cast(ExternKernelSchedulerNode, node)
                 self.codegen_extern_call(node)
+            elif node.is_fusable_user_triton():
+                node = typing.cast(FusableUserDefinedKernelSchedulerNode, node)
+                # print("HOLY MOLY")
+                # print(type(self.get_backend(device)))
+                self.get_backend(device).codegen_fusable_user_defined_triton_kernel(
+                    node
+                )  # type: ignore
             elif node.is_foreach():
                 node = typing.cast(ForeachKernelSchedulerNode, node)
                 # pyrefly: ignore [unbound-name]
@@ -6549,6 +6773,15 @@ class BaseScheduling:  # noqa: docstring_linter
     ) -> tuple[tuple[sympy.Expr, ...], ...]:
         """
         Process the iteration sizes in case a transformation needs to be applied.
+        """
+        raise NotImplementedError
+
+    def codegen_fusable_user_defined_triton_kernel(
+        self,
+        scheduler_node: FusableUserDefinedKernelSchedulerNode,
+    ) -> Optional[str]:
+        """
+        TODO
         """
         raise NotImplementedError
 

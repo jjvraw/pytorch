@@ -24,6 +24,7 @@ import torch._logging
 import torch.utils._pytree as pytree
 from torch._dynamo.device_interface import get_interface_for_device
 from torch._dynamo.utils import identity, preserve_rng_state
+from torch._inductor.ir import IRNode
 from torch._prims_common import is_integer_dtype
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.functions import CeilDiv, FloorDiv, ModularIndexing
@@ -49,7 +50,14 @@ from ..runtime.hints import (
     TRITON_MAX_RSPLIT,
 )
 from ..runtime.runtime_utils import get_max_y_grid, next_power_of_2
-from ..scheduler import BaseSchedulerNode, FusedSchedulerNode, Scheduler, SchedulerNode
+from ..scheduler import (
+    BaseSchedulerNode,
+    FusableUserDefinedKernelSchedulerNode,
+    FusedSchedulerNode,
+    Scheduler,
+    SchedulerBuffer,
+    SchedulerNode,
+)
 from ..shape_propagation import get_broadcasted_shape
 from ..utils import (
     cache_on_self,
@@ -5879,6 +5887,209 @@ class TritonScheduling(SIMDScheduling):
                 [*cls.backend_features, BackendFeature.REDUCE_TO_SINGLE_ELEMENT]
             )
         return cls.backend_features
+
+    def _extract_epilogue_compute(self, prologue_node, epilogue_node, triton_binding):
+        from torch._inductor.codegen.common import IndentedBuffer
+        from torch._inductor.codegen.triton import TritonOverrides
+
+        class CodeCapturingOps(TritonOverrides):
+            def __init__(self, buffer, buf_to_varname, buf_to_argname, buf_to_access):
+                self.buffer = buffer
+                self.buffer._code_buffer = 1
+                self.tmp_counter = 0
+                self.idx_counter = 0
+                self.mask_counter = 0
+                self.buf_to_varname = buf_to_varname
+                self.buf_to_argname = buf_to_argname
+                self.buf_to_access = buf_to_access
+
+                self.buffer.writeline("# ==== Begin of Epilogue Codegen =====")
+                self.buffer.writeline("")
+
+            def load(self, name, index):
+                if name in self.buf_to_varname.keys():
+                    var = self.buf_to_varname[name]
+                else:
+                    # TODO[JJV] If we are raising we might as well try...catch with direct index?
+                    raise
+
+                return var
+
+            def store(self, name, index, value, mode):
+                if name in self.buf_to_argname:
+                    # Store value as a variable
+                    var = f"tmp{self.tmp_counter}"
+                    self.tmp_counter += 1
+                    self.buffer.writeline(f"{var} = {value}")
+
+                    # Store pointer access as variable
+                    access = self.buf_to_access[name][0]
+                    idx_var = f"idx{self.idx_counter}"
+                    self.idx_counter += 1
+                    self.buffer.writeline(f"{idx_var} = {access}")
+
+                    # Store mask as variable
+                    mask = self.buf_to_access[name][1]
+                    mask_arg = ""
+                    if mask:
+                        msk_var = f"msk{self.mask_counter}"
+                        self.mask_counter += 1
+                        self.buffer.writeline(f"{msk_var} = {mask}")
+                        mask_arg = f", mask={msk_var}"
+
+                    arg_name = self.buf_to_argname[name]
+                    self.buffer.writeline(
+                        f"tl.store({arg_name} + {idx_var}, {var}{mask_arg})"
+                    )
+
+                    return value
+                else:
+                    raise ValueError(f"Cannot store to unknown buffer {name}")
+
+        code_buffer = IndentedBuffer(initial_indent=1)
+        ops = CodeCapturingOps(
+            code_buffer,
+            triton_binding.buf_to_varname,
+            triton_binding.output_buf_to_argname,
+            triton_binding.buf_to_access,
+        )
+
+        # Get the actual index variables from the sizes
+        # sizes is a tuple of sequences
+        index_vars = []
+        for size_group in epilogue_node._sizes:
+            group_vars = [sympy.Symbol(f"idx{i}") for i in range(len(size_group))]
+            index_vars.append(group_vars)
+
+        # Call with the properly structured index vars
+        with V.set_ops_handler(ops):
+            epilogue_node._body(*index_vars)
+
+        code_buffer.writeline("")
+        code_buffer.writeline("# ==== End of Epilogue Codegen =====")
+
+        return code_buffer.getvalue()
+
+    def codegen_fusable_user_defined_triton_kernel(self, scheduler_node):
+        from ..virtualized import V
+
+        assert isinstance(scheduler_node, FusedSchedulerNode)
+
+        nodes = scheduler_node.get_nodes()
+
+        user_defined_scheduler_node = nodes[0]
+        assert isinstance(
+            user_defined_scheduler_node, FusableUserDefinedKernelSchedulerNode
+        )
+
+        iir_node = user_defined_scheduler_node.node
+        assert isinstance(iir_node, ir.FusableUserDefinedTritonKernel)
+        assert iir_node is not None  # For LSP
+
+        kernel_wrapper = iir_node.make_kernel_render()
+
+        # Remaning nodes are epilogue nodes
+        epilogue_nodes = [n for n in nodes[1:] if isinstance(n, SchedulerNode)]
+
+        # Triton kernels do not return an output, but rather mutate arguments.
+        # However, this is somewhat represented as an output in the dep-graph.
+
+        # We will work from the persepctive of the consumer (epilogue kernel), to avoid
+        # changing dependencies of subeqeuent operations (that is, the subsequent to this fused kernel).
+        # Thus, we will work backwards from the epilogue:
+        #       (1) get the ouput buffer of the subsequent.
+        #       (2) redirect the user-kernel with (1)'s buffer.
+        #           this is apart of the mutated buffers of the user-kernels.
+        #       (3) mark intermediate buffers as removed, so they're not allocated.
+
+        user_kernel_output_buf = user_defined_scheduler_node.get_outputs()[0]
+        assert isinstance(user_kernel_output_buf, SchedulerBuffer), (
+            f"{type(user_kernel_output_buf)}"
+        )
+
+        # Get mutable arguments of user-kernel. These are in the form of TensorBox.
+        # For our example we only have one argument/buffer that is mutated.
+        assert len(iir_node.mutable_args) == 1
+        mutated_buffer_name = iir_node.mutable_args[0].get_name()
+        assert isinstance(iir_node.mutable_args[0], ir.TensorBox)
+
+        # Get epilogue SchedulerBuffer.
+        epilogue_output_buf = epilogue_nodes[0].get_outputs()[0]
+        epilogue_output_name = epilogue_output_buf.get_name()
+
+        # Replace in kwargs.
+        epilogue_ir_buf = epilogue_output_buf.node
+        # TODO: I dont like the way this is done. Perhaps we add some mapping to the iir_node
+        #       during initialisation or analysis.
+        for key, value in iir_node.kwargs.items():
+            # TODO: Is there a case where an IRNode for Triton kernel will not have this implemented?
+            if isinstance(value, IRNode) and value.get_name() == mutated_buffer_name:
+                iir_node.kwargs[key] = epilogue_ir_buf
+                break
+        else:
+            assert False
+
+        # Mark intermediate buffers as removed
+        kernel_wrapper.removed_buffers.add(mutated_buffer_name)  # buf1
+        kernel_wrapper.removed_buffers.add(user_kernel_output_buf.get_name())  # buf2
+
+        # Currently, the render() function and hooks are hardcoded for the
+        # specific GeLU + scale example. A general implementation would need
+        # to introspect both the user-defined and epilogue bodies and codegen the
+        # appropriate Triton code.
+        # with kernel_wrapper:
+        #     partial_code = render()
+        #     partial_code.finalize_hook("<KERNEL_BODY>")
+        #     print(partial_code.code)
+        #     partial_code.finalize_hook("<EPILOGUE_FUSION>", modded_src)
+        #
+        #     src_code = partial_code.code
+
+        # Get original source
+        original_src = kernel_wrapper.jit_kernel.src
+        store_line_num = next(iter(scheduler_node.triton_binding.store_locs.values()))
+        lines = original_src.splitlines()
+        lines.pop(store_line_num)
+        original_src = "\n".join(lines)
+        epilogue_code = self._extract_epilogue_compute(
+            iir_node, epilogue_nodes[0], scheduler_node.triton_binding
+        )
+
+        src_code = original_src + "\n" + epilogue_code
+        print(src_code)
+
+        # kernel_wrapper.jit_kernel.__dict__['src'] = src_code
+        # kernel_wrapper.jit_kernel.src = src_code
+        wrapper = V.graph.wrapper_code
+        user_kernel = kernel_wrapper.user_defined_kernel
+
+        (
+            kernel_name,
+            triton_meta,
+            extra_launch_args,
+        ) = wrapper.define_user_defined_triton_kernel(
+            kernel_wrapper.jit_kernel,
+            kernel_wrapper.configs,
+            user_kernel.kwargs,
+            kernel_wrapper.restore_value_args,
+            kernel_wrapper.reset_to_zero_args,
+            user_kernel.grid,
+            src_code,  # TODO: CHECK THIS LOGIC !!!!
+        )
+
+        kernel_wrapper.kernel_name = kernel_name
+        kernel_wrapper.extra_launch_args = extra_launch_args
+
+        with V.set_kernel_handler(kernel_wrapper):
+            for node in scheduler_node.get_nodes():
+                node.mark_run()
+
+        # kernel_wrapper.call_kernel(kernel_name, scheduler_node)
+        kernel_wrapper.call_kernel(kernel_name)
+
+        V.graph.removed_buffers |= kernel_wrapper.removed_buffers
+        V.graph.inplaced_to_remove |= kernel_wrapper.inplaced_to_remove
+        self.free_buffers_in_scheduler()
 
     def codegen_comment(self, node_schedule, kernel_name=None):
         wrapper = V.graph.wrapper_code

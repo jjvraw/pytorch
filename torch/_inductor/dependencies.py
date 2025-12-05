@@ -8,6 +8,7 @@ from typing import Any, Optional, TypeVar, Union
 from typing_extensions import Self
 from unittest.mock import patch
 
+import islpy as isl
 import sympy
 
 import torch
@@ -70,6 +71,82 @@ class Dep(abc.ABC):
 
     def normalize_with_stride_order(self, prefix: str = "t") -> Self:
         return self
+
+
+@dataclasses.dataclass(frozen=True)
+class UserTritonDep(Dep):
+    # pyrefly: ignore [bad-override]
+    name: str
+    # pyrefly: ignore [bad-override]
+    index: sympy.Expr
+    mask: Optional[sympy.Expr]
+    access_map: isl.Map
+    index_str: str
+    var_names: tuple[sympy.Symbol, ...]
+    size: tuple[sympy.Expr, ...]
+    mode: Optional[str] = None
+    arg_name: str | None = None
+    operand_name: str | None = None
+    loc: int | None = None
+
+    def get_free_symbol_uses(
+        self, unbacked_only: bool = False
+    ) -> OrderedSet[sympy.Symbol]:
+        return (
+            get_free_symbols(self.index, unbacked_only)
+            | get_free_symbols(self.size, unbacked_only)
+            | get_free_symbols(self.var_names, unbacked_only)
+            | (
+                get_free_symbols(self.mask, unbacked_only)
+                if self.mask is not None
+                else OrderedSet()
+            )
+        )
+
+    def rename(self, renames: dict[str, str]) -> "UserTritonDep":
+        if self.name in renames:
+            return UserTritonDep(
+                renames[self.name],
+                self.index,
+                self.mask,
+                self.access_map,
+                var_names=self.var_names,
+                size=self.size,
+                mode=self.mode,
+            )
+
+        return self
+
+    def get_numel(self) -> sympy.Expr:
+        accessed_set = self.access_map.range()
+        return sympy.Integer(accessed_set.count_val().get_num_si())
+
+    def numbytes_hint(self) -> int:
+        accessed_set = self.access_map.range()
+        n = accessed_set.count_val()
+        return n.get_num_si()
+
+    def numel_hint(self) -> int:
+        accessed_set = self.access_map.range()
+        return accessed_set.count_val().get_num_si()
+
+    def has_unbacked_symbols(self) -> bool:
+        return False
+
+    def is_contiguous(self) -> bool:
+        accessed_set = self.access_map.range()
+
+        if accessed_set.is_singleton():
+            return True
+
+        hull = accessed_set.convex_hull()
+        return accessed_set.is_equal(hull)
+
+    def __repr__(self) -> str:
+        maybe_mode = ""
+        if self.mode is not None:
+            maybe_mode = f", {self.mode}"
+        return f"UserTritonDep({self.name!r}, {self.access_map}{maybe_mode})"
 
 
 @dataclasses.dataclass(frozen=True)

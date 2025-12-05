@@ -3,11 +3,15 @@ from __future__ import annotations
 
 from typing import Any, Optional, TYPE_CHECKING, Union
 
+from torch._inductor.ir import FusableUserDefinedTritonKernel, IRNode, TensorBox
+
 from ..scheduler import (
     BaseSchedulerNode,
     BaseScheduling,
+    FusableUserDefinedKernelSchedulerNode,
     FusedSchedulerNode,
     Scheduler,
+    SchedulerBuffer,
     SchedulerNode,
 )
 from .cuda.cuda_cpp_scheduling import CUDACPPScheduling
@@ -93,6 +97,21 @@ class CUDACombinedScheduling(BaseScheduling):
         self, sizes: Sequence[Sequence[_IntLike]]
     ) -> tuple[tuple[_IntLike, ...], ...]:
         return self._triton_scheduling.group_fn(sizes)
+
+    def codegen_fusable_user_defined_triton_kernel(
+        self,
+        scheduler_node
+    ):
+        """
+        NOTE: This is for a simple epilogue fusion (user-defined = producer, scheduler-node = consumer).
+        Two main goals, in order:
+            1. BUFFER MANAGEMENT: 
+                - Resolve intermediate buffers, 
+                - and correct input/output buffers of `FusedSchedulerNode`.
+            2. MERGE COMPUTATION:
+                - Combine the epilogue's computation into the user kernel's source code.
+        """
+        return self._triton_scheduling.codegen_fusable_user_defined_triton_kernel(scheduler_node)
 
     def codegen_template(
         self,

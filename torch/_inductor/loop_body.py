@@ -577,7 +577,6 @@ class LoopBodyBlock:
     def __call__(self):
         graph = self.graph
         submodules = self.body.submodules
-
         return InterpreterShim(graph, submodules).run(V.get_ops_handler())
 
     def debug_str(self, name="block"):

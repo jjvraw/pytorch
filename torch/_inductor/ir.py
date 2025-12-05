@@ -113,6 +113,11 @@ from .virtualized import ops, OpsValue, V
 
 
 if TYPE_CHECKING:
+    from torch._higher_order_ops.triton_kernel_wrap import (
+        AccessPatternAnalysis,
+        ReadPattern,
+        WritePattern,
+    )
     from torch._library.fake_class_registry import FakeScriptObject
     from torch.fx.experimental.symbolic_shapes import SympyBoolean
     from torch.fx.node import Argument
@@ -7156,6 +7161,481 @@ class UserDefinedTritonKernel(ExternKernel):
 
     def get_device(self) -> Optional[torch.device]:
         return self.device
+
+
+@ir_dataclass(frozen=False)
+class FusableUserDefinedTritonKernel(UserDefinedTritonKernel):
+    def __init__(
+        self,
+        *,
+        kernel_idx: int,
+        grid: Any,
+        tma_descriptor_metadata: dict[str, Any],
+        kernel_args: dict[str, Any],
+    ):
+        self.kernel_args = kernel_args.copy()
+
+        # Same as UserDefinedTritonKernel
+        inputs: list[IRNode] = []
+        kwargs: dict[str, IRNode] = {}
+        constant_args: list[IRNode] = []
+
+        for k, v in kernel_args.items():
+            if isinstance(v, TensorBox):
+                t = InputsKernel.unwrap_storage_for_input(self.realize_input(v))
+                if k in tma_descriptor_metadata:
+                    t = TMADescriptor.create(t, tma_descriptor_metadata[k])
+                inputs.append(t)
+                kwargs[k] = t
+            else:
+                constant_args.append(v)
+                kwargs[k] = v
+
+        assert len(inputs) != 0
+        self.device = inputs[0].get_device()
+
+        assert isinstance(inputs, Sequence), type(inputs)
+        ExternKernel.__init__(
+            self,
+            None,
+            NoneLayout(device=self.device),
+            inputs,
+            tuple(constant_args),
+            kwargs,
+        )
+        self.kernel_idx = kernel_idx
+        self.grid = grid
+
+        kernel, configs, _, _ = self.get_kernel_and_metadata()
+        self.arg_names = kernel.arg_names  # type: ignore
+
+        # If we are autotuning, not all arguments will be passed
+        assert hasattr(kernel, "arg_names")
+        self.ordered_kwargs_for_cpp_kernel = [
+            arg for arg in self.arg_names if arg in kernel_args
+        ]
+        # End of UserDefinedTritonKernel
+
+        from torch._higher_order_ops.triton_kernel_wrap import identify_access_patterns
+
+        # TODO[JJV]: Gotta figure out how autuning influences this this...
+        autotuned_kwargs = configs[0].kwargs if len(configs) > 0 else {}
+
+        # TODO[JJV]: handling here in case of failure!
+        # Fall back to UserDefinedTritonKernel...
+        analysis: AccessPatternAnalysis = identify_access_patterns(
+            # type: ignore
+            kernel,
+            {**kernel_args, **autotuned_kwargs},
+            tma_descriptor_metadata,
+            self.grid[0],
+        )
+
+        self.sym_meta = analysis.sym_meta
+        self._extract_read_write_patterns(
+            analysis.reads, analysis.writes, analysis.sym_to_val
+        )
+
+        V.graph.register_operation(self)
+
+    def _extract_read_write_patterns(
+        self,
+        reads_in: list[ReadPattern],
+        writes_in: list[WritePattern],
+        sym_to_val: dict[sympy.Symbol, int],
+    ):
+        import islpy as isl
+
+        from torch._higher_order_ops.triton_kernel_wrap import ParamSymbol
+
+        self.mutable_args = []
+        self.mutation_outputs = []
+        self.reads = OrderedSet()
+        self.writes = OrderedSet()
+
+        self.buffer_to_argname: dict[str, str] = {}
+
+        def build_map(
+            index_expr: sympy.Expr,
+            var_names: tuple[sympy.Symbol, ...],
+            size: tuple[int, ...],
+            mask: Optional[sympy.Expr] = None,
+        ) -> Tuple[isl.Map, str]:
+            if not var_names:
+                index_str = str(index_expr)
+                return isl.Map(f"{{ [] -> [{index_str}] }}")
+
+            domain_constraints = []
+            for var, sz in zip(var_names, size):
+                domain_constraints.append(f"0 <= {var.name} < {sz}")
+
+            if mask is not None and mask != sympy.true:
+                domain_constraints.append(str(mask))
+
+            domain_str = " and ".join(domain_constraints)
+            iter_tuple = ", ".join(v.name for v in var_names)
+            index_str = str(index_expr)
+
+            map_str = f"{{ [{iter_tuple}] -> [{index_str}] : {domain_str} }}"
+            print(map_str)
+
+            return isl.Map(map_str), index_str
+
+        def get_dep_vars(
+            access_ptrn: sympy.Expr,
+        ) -> tuple[Any, sympy.Expr, tuple[sympy.Symbol, ...], tuple[int, ...], str]:
+            input_buf_sym = next(
+                s for s in access_ptrn.free_symbols if isinstance(s, ParamSymbol)
+            )
+
+            arg_name = self.arg_names[input_buf_sym.get_index()]
+            input_buf = self.kernel_args[self.arg_names[input_buf_sym.get_index()]]
+            index_expr: sympy.Expr = access_ptrn.subs({input_buf_sym: 0})  # type: ignore[assignment]
+            var_names: tuple[sympy.Symbol, ...] = tuple(
+                sorted(
+                    cast(OrderedSet[sympy.Symbol], index_expr.free_symbols),
+                    key=lambda s: s.name,
+                )
+            )
+            size = tuple([sym_to_val[s] for s in var_names])
+
+            return input_buf, index_expr, var_names, size, arg_name
+
+        for write in writes_in:
+            input_buf, index_expr, var_names, size, arg_name = get_dep_vars(
+                write.ptr_expr
+            )
+            mask = write.mask_expr
+
+            self.mutable_args.append(input_buf)
+            mutation_output = MutationOutput(
+                NoneLayout(device=self.device), input_buf, self
+            )
+            self.mutation_outputs.append(mutation_output)
+
+            buf_name = mutation_output.get_name()
+            self.buffer_to_argname[buf_name] = arg_name
+
+            map, index_str = build_map(index_expr, var_names, size, mask)
+
+            write_dep = dependencies.UserTritonDep(
+                name=buf_name,
+                arg_name=arg_name,
+                index=index_expr,
+                mask=mask,
+                var_names=var_names,
+                size=size,
+                access_map=map,
+                index_str=index_str,
+                mode=None,
+                operand_name=write.operand_name,
+                loc=write.loc,
+            )
+            self.writes.add(write_dep)
+
+            read_dep = dependencies.UserTritonDep(
+                name=input_buf.get_name(),
+                arg_name=arg_name,
+                index=index_expr,
+                mask=mask,
+                var_names=var_names,
+                size=size,
+                access_map=map,
+                index_str=index_str,
+                mode=None,
+                operand_name=write.operand_name,
+                loc=write.loc,
+            )
+            self.reads.add(read_dep)
+
+            # TODO[JJV]: Do we need both here?
+            self.buffer_to_argname[input_buf.get_name()] = arg_name
+
+        for read in reads_in:
+            input_buf, index_expr, var_names, size, arg_name = get_dep_vars(
+                read.ptr_expr
+            )
+            mask = read.mask_expr
+
+            map, index_str = build_map(index_expr, var_names, size, mask)
+            self.buffer_to_argname[input_buf.get_name()] = arg_name
+
+            read_dep = dependencies.UserTritonDep(
+                name=input_buf.get_name(),
+                index=index_expr,
+                mask=mask,
+                var_names=var_names,
+                size=size,
+                access_map=map,
+                index_str=index_str,
+                mode=None,
+            )
+            self.reads.add(read_dep)
+
+        # print(f"{self.buffer_to_argname=}")
+
+    def make_kernel_render(self):
+        from triton.runtime.jit import JITFunction  # type: ignore
+
+        from .select_algorithm import PartialRender
+
+        kernel, configs, restore_value_args, reset_to_zero_args = (
+            self.get_kernel_and_metadata()
+        )
+
+        # TODO: For the specific example we are working on, there is no autotuning.
+        # thus the kernel is of type JITFunction.
+
+        assert isinstance(kernel, JITFunction)
+
+        kernel_wrapper = UserDefinedTritonKernelWrapper(
+            jit_kernel=kernel,
+            configs=configs,
+            restore_value_args=restore_value_args,
+            reset_to_zero_args=reset_to_zero_args,
+            user_defined_kernel=self,
+        )
+
+        kernel_src = kernel.src  # type: ignore
+
+        def render():
+            modified_src = kernel_src.replace(
+                "tl.store(output_ptr + offsets, gelu_result, mask=mask)",
+                "<EPILOGUE_FUSION>\n",
+            )
+
+            template_code = "<KERNEL_BODY>"
+
+            def kernel_body_hook():
+                return modified_src
+
+            def epilogue_hook():
+                return """
+    # Epilogue fusion
+    scaled = gelu_result * 0.5
+    tl.store(output_ptr + offsets, scaled, mask=mask)
+"""
+
+            return PartialRender(
+                code=template_code,
+                replacement_hooks={
+                    "<KERNEL_BODY>": kernel_body_hook,
+                    "<EPILOGUE_FUSION>": epilogue_hook,
+                },
+            )
+
+        kernel_wrapper = UserDefinedTritonKernelWrapper(
+            jit_kernel=kernel,
+            configs=configs,
+            restore_value_args=restore_value_args,
+            reset_to_zero_args=reset_to_zero_args,
+            user_defined_kernel=self,
+        )
+
+        return kernel_wrapper
+
+        return kernel_wrapper, render
+
+    def get_read_writes(self) -> dependencies.ReadWrites:
+        from torch._higher_order_ops.triton_kernel_wrap import (
+            generate_ttir,
+            ttir_to_functions,
+        )
+
+        # TODO: Currently this is entirely hardcoded for our custom triton kernel.
+        # This is where our (generic) analysis will take place. Probably the crux
+        # of thesis.
+
+        kernel, configs, restore_value_args, reset_to_zero_args = (
+            self.get_kernel_and_metadata()
+        )
+        # for name in kernel.arg_names:
+        #     print(name)
+
+        # print(f"DEBUG kernel: {kernel}")
+        # print(f"DEBUG kernel.arg_names: {kernel.arg_names}")
+        # print(
+        #     f"DEBUG kernel.params: {[(p.name, p.num, p.is_constexpr) for p in kernel.params]}"
+        # )
+        # print(f"DEBUG original_kernel_args keys: {list(self.kernel_args.keys())}")
+        ttir_module, ordered_tensor_names = generate_ttir(
+            kernel,
+            self.kernel_args,
+            {},  # tma_descriptor_metadata
+        )
+
+        print(f"{ttir_module=}")
+        # print(f"{ordered_tensor_names=}")
+
+        functions = ttir_to_functions(ttir_module)
+
+        kernel_name = next(iter(functions.keys()))
+        ops = functions[kernel_name]
+
+        # for intermediate, op_list in ops.items():
+        #     print(f"\nIntermediate {intermediate}:")
+        #     for op in op_list:
+        #         print(f"  Op: {op.name}")
+        #         print(f"    Args: {op.args}")
+        #         print(f"    Returns: {op.ret}")
+        #         if op.fn_call_name:
+        #             print(f"    Calls: {op.fn_call_name}")
+        #         if op.is_pure:
+        #             print(f"    Pure: {op.is_pure}")
+
+        input_buf = self.inputs[0]  # buf0 - from nop
+        mutated_buf = self.mutable_args[0]  # buf1 - what we're mutating
+        output_buf = self.get_outputs()[0]  # buf2 - the MutationOutput
+
+        # Currently setup using dimension-based indexing.
+        # This will eventually have to be cannonicalised (I assume)
+        # during/for fusion analysis.
+        d0 = sympy.Symbol("d0", integer=True, nonnegative=True)
+        d1 = sympy.Symbol("d1", integer=True, nonnegative=True)
+
+        layout = mutated_buf.get_layout()
+        index_expr = 4096 * d0 + d1
+        var_names = (d0, d1)
+        size = tuple(layout.size)
+
+        # print(f"BLAH BLAH\n{input_buf=}\n{mutated_buf=}\n{output_buf}\n{layout=}{index_expr=}\n{var_names=}\n{size=}")
+
+        reads = OrderedSet(
+            [
+                dependencies.MemoryDep(
+                    name=input_buf.get_name(),  # buf0
+                    index=index_expr,
+                    var_names=var_names,
+                    size=size,
+                    mode=None,
+                ),
+                dependencies.MemoryDep(
+                    name=mutated_buf.get_name(),  # buf1 - reading before mutation
+                    index=index_expr,
+                    var_names=var_names,
+                    size=size,
+                    mode=None,
+                ),
+            ]
+        )
+
+        # We write to the OUTPUT buffer name, not the mutated buffer.
+        # This is obvious in hindsight, but I made an issue of this prior,
+        # so just making a note here.
+        writes = OrderedSet(
+            [
+                dependencies.MemoryDep(
+                    name=output_buf.get_name(),
+                    index=index_expr,
+                    var_names=var_names,
+                    size=size,
+                    mode=None,
+                )
+            ]
+        )
+
+        return dependencies.ReadWrites(
+            reads=self.reads,
+            writes=self.writes,
+            index_exprs=OrderedSet([index_expr]),
+            range_vars=None,
+            var_ranges=None,
+        )
+
+
+class UserDefinedTritonKernelWrapper:
+    """Wrapper for user-defined Triton kernels to work with PartialRender.
+    TODO: Im not sure where this class should live.
+    """
+
+    def __init__(
+        self,
+        jit_kernel,
+        configs,
+        restore_value_args,
+        reset_to_zero_args,
+        user_defined_kernel,
+    ):
+        self.jit_kernel = jit_kernel
+        self.configs = configs
+        self.restore_value_args = restore_value_args
+        self.reset_to_zero_args = reset_to_zero_args
+        self.user_defined_kernel = user_defined_kernel
+
+        # TODO: Will need class vars for future prologue/epilogue nodes.
+        self.prologue_fused_inputs = OrderedSet()
+        self.removed_buffers = OrderedSet()
+        self.inplaced_to_remove = OrderedSet()
+        self.kernel_name = None
+        self.extra_launch_args = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    def call_kernel(self, name: str):
+        """Generate the kernel call code"""
+        from torch._inductor.utils import triton_version_uses_attrs_dict
+
+        wrapper = V.graph.wrapper_code
+        user_kernel = self.user_defined_kernel
+
+        named_args = {
+            k: user_kernel.get_kwargs_value(k)
+            for k in user_kernel.ordered_kwargs_for_cpp_kernel
+        }
+
+        constexpr_names = OrderedSet(
+            self.jit_kernel.arg_names[i] for i in self.jit_kernel.constexprs
+        )
+
+        # Process arguments as UserDefinedTritonKernel.codegen
+        args: list[Any] = []
+        arg_types: list[Any] = []
+        raw_keys_filtered: list[Any] = []
+        raw_args_filtered: list[Any] = []
+
+        for arg_name, arg in itertools.chain(
+            named_args.items(),
+            zip(itertools.repeat(""), self.extra_launch_args),  # ← Add grid args!
+        ):
+            if arg_name in constexpr_names and triton_version_uses_attrs_dict():
+                continue
+
+            raw_keys_filtered.append(arg_name)
+            raw_args_filtered.append(arg)
+
+            if isinstance(arg, IRNode):
+                args.append(arg.codegen_reference())
+                arg_types.append(arg.get_dtype())
+            elif isinstance(arg, (int, float, bool, sympy.Expr)):
+                args.append(arg)
+                arg_types.append(type(arg))
+            elif arg_name in constexpr_names:
+                args.append(-1)
+                arg_types.append(int)
+            elif arg is None:
+                if triton_version_uses_attrs_dict():
+                    args.append(-1)
+                    arg_types.append(int)
+                else:
+                    raw_keys_filtered.pop()
+                    raw_args_filtered.pop()
+            else:
+                raise NotImplementedError(f"Unsupported arg type: {type(arg)}: {arg}")
+
+        wrapper.generate_kernel_call(
+            name,
+            args,
+            arg_types=arg_types,
+            raw_args=raw_args_filtered,
+            raw_keys=raw_keys_filtered,
+            triton=True,
+            device=user_kernel.get_device(),
+            original_fxnode_name=user_kernel.fx_node.name,
+        )
 
 
 class InplaceBernoulliFallback(ExternKernel):
