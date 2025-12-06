@@ -48,7 +48,7 @@ from ..optimize_indexing import indexing_dtype_strength_reduction
 from ..runtime.coordinate_descent_tuner import CoordescTuner
 from ..runtime.hints import DeviceProperties
 from ..runtime.runtime_utils import green_text, last_power_of_2, yellow_text
-from ..scheduler import BaseSchedulerNode, BaseScheduling, FusableUserDefinedKernelSchedulerNode, WhyNoFuse
+from ..scheduler import BaseSchedulerNode, BaseScheduling, WhyNoFuse
 from ..utils import (
     cache_property_on_self,
     expr_fits_within_32bit,
@@ -1287,6 +1287,7 @@ class SIMDScheduling(BaseScheduling):
         can fuse node1 and node2.  These nodes might already be
         FusedSchedulerNodes.
         """
+
         if isinstance(node1, scheduler.ForeachKernelSchedulerNode) or isinstance(
             node2, scheduler.ForeachKernelSchedulerNode
         ):
@@ -1814,11 +1815,6 @@ class SIMDScheduling(BaseScheduling):
         if len(nodes) == 0:
             return
 
-        user_kernel_nodes = [n for n in nodes if isinstance(n, FusableUserDefinedKernelSchedulerNode)]
-
-        # if user_kernel_nodes:
-        #     return self.codegen_user_defined_kernel_fusion(node, user_kernel_nodes, nodes)
-
         if torch._inductor.config.triton.coalesce_tiling_analysis:
             if len(nodes) != len(node.get_nodes()):
                 assert self.scheduler
@@ -1829,9 +1825,10 @@ class SIMDScheduling(BaseScheduling):
 
         return self._codegen_nodes(nodes, coalesce_analysis)  # type: ignore[arg-type]
 
-    def codegen_user_defined_kernel_fusion(self, fused_node, user_kernel_nodes, all_nodes):
+    def codegen_user_defined_kernel_fusion(
+        self, fused_node, user_kernel_nodes, all_nodes
+    ):
         print("=" * 5, "CUSTOM CODEGEN PATH FOR USER KERNEL", "=" * 5)
-
 
     def emit_fused_kernel_call(self, kernel_name, user_kernel_node, consumer_nodes):
         # choose 1st read as input, 1st write as output for Phase 1

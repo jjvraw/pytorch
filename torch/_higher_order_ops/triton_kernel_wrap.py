@@ -230,11 +230,36 @@ class Op:
     # `is_pure = True` assumes the asm block has no side-effects
     is_pure: bool = False
 
+    int_attrs: dict[str, int] = dataclasses.field(default_factory=dict)
+
     def __post_init__(self) -> None:
         if self.name == "tt.call":
             assert self.fn_call_name is not None
         else:
             assert self.fn_call_name is None
+
+    def get_int_attr(self, key: str) -> int:
+        # When calling get_int_attr we expect there to be a valid return.
+        # Raise otherwise.
+        value = self.int_attrs.get(key, None)
+        if value is None:
+            log.debug("Missing int_attr %s on op %s", key, self)
+            raise KeyError(key)
+
+        return value
+
+
+class ParamSymbol(sympy.Symbol):
+    # Moreso for LSP
+    __slots__ = ["index"]
+
+    def __new__(cls, name, index):
+        obj = super().__new__(cls, name)
+        obj.index = index
+        return obj
+
+    def get_index(self) -> int:
+        return self.index
 
 
 def generate_ttir(
@@ -765,6 +790,17 @@ def ttir_to_functions(
             ]
             block_ops = op_stack[parent_block_id]
 
+            op_int_attrs = {}
+            if name == "tt.get_program_id":
+                op_int_attrs["axis"] = op.get_int_attr("axis")
+            elif name == "tt.make_range":
+                op_int_attrs["start"] = op.get_int_attr("start")
+                op_int_attrs["end"] = op.get_int_attr("end")
+            elif name == "arith.constant":
+                op_int_attrs["value"] = op.get_int_attr("value")
+            elif name == "arith.cmpi":
+                op_int_attrs["predicate"] = op.get_int_attr("predicate")
+
             is_pure = False
             # Handle the case for tt.elementwise_inline_asm to set `is_pure` for mutation analysis
             if name == "tt.elementwise_inline_asm":
@@ -773,12 +809,28 @@ def ttir_to_functions(
             if result_ids:
                 for result_id in result_ids:
                     res = Intermediate(result_id)
-                    block_ops[res].append(Op(name, callee, args, res, is_pure=is_pure))
+                    block_ops[res].append(
+                        Op(
+                            name,
+                            callee,
+                            args,
+                            res,
+                            is_pure=is_pure,
+                            int_attrs=op_int_attrs,
+                        )
+                    )
             else:
                 next_fake_intermediate -= 1
                 fake_res = Intermediate(next_fake_intermediate)
                 block_ops[fake_res].append(
-                    Op(name, callee, args, fake_res, is_pure=is_pure)
+                    Op(
+                        name,
+                        callee,
+                        args,
+                        fake_res,
+                        is_pure=is_pure,
+                        int_attrs=op_int_attrs,
+                    )
                 )
 
     ttir_module.walk(mlir_to_functions)
@@ -995,9 +1047,6 @@ def identify_mutated_tensors(
         mutations = analyze_kernel_mutations(
             functions, kernel_name, len(ordered_arg_names)
         )
-        # analyze_kernel_access_patterns(
-        #     functions, kernel_name, len(ordered_tensor_names), [256, 1, 1] 
-        # )
 
         return [
             ordered_arg_names[i]
@@ -1025,71 +1074,194 @@ def identify_mutated_tensors(
             if isinstance(value, (Tensor, torch._inductor.ir.TensorBox))
         ]
 
-def analyze_kernel_access_patterns(
-    functions: dict[str, dict[Intermediate, list[Op]]], fn_name: str, num_args: int, grid
-    ):
 
+def identify_access_patterns(
+    kernel: "TritonKernelType",
+    kwargs: dict[str, Any],
+    tma_descriptor_metadata: TMADescriptorMetadata,
+    grid: Any,
+) -> tuple[
+    list[tuple[sympy.Expr, sympy.Expr | None]],
+    list[tuple[sympy.Expr, sympy.Expr | None]],
+    dict[sympy.Symbol, int],
+]:
+    """
+    Very much like `identify_mutated_tensors`, given a kernel and arguments for this kernel,
+    we
+    1) Retrieves the TTIR converted version of the kernel from Triton's API.
+    2) Parses the TTIR and creates a control flow graph
+    3) Analyzes the graph to detect all input tensor mutations
+    """
+
+    try:
+        ttir_module, ordered_tensor_names = generate_ttir(
+            kernel, kwargs, tma_descriptor_metadata
+        )
+
+        # extract functions from TTIR using MLIR bindings exposed by Triton code
+        functions = ttir_to_functions(ttir_module)
+
+        assert functions is not None
+        kernel_name = next(iter(functions.keys()))
+        # Triton codegen modifies the name
+        # pyrefly: ignore [missing-attribute]
+        assert kernel.fn.__name__ in kernel_name
+        # Reset the cache between top level invocations
+        # The cache for analyze kernel mutations is mainly used for cycle
+        # detection, so each top level invocation needs a clean cache
+        analyze_kernel_mutations.reset()
+        get_tma_stores.reset()
+
+        arg_names = kernel.arg_names
+        return analyze_access_patterns(
+            functions, kernel_name, len(ordered_tensor_names), grid, kwargs, arg_names
+        )
+
+    except Exception as e:
+        # TODO[JJV]: handle properly.
+        print(e)
+        raise ValueError
+
+
+def analyze_access_patterns(
+    functions: dict[str, dict[Intermediate, list[Op]]],
+    fn_name: str,
+    num_args: int,
+    grid: Any,
+    kwargs: dict[str, Any],
+    arg_names: list[str],
+) -> tuple[
+    list[tuple[sympy.Expr, sympy.Expr | None]],
+    list[tuple[sympy.Expr, sympy.Expr | None]],
+    dict[sympy.Symbol, int],
+]:
     # why do we index into functions? does this imply that functions can have multiple calls to other kernels?
     ops = functions[fn_name]
-    sym_meta = {}
+    sym_to_val = {}
+    sym_to_val: dict[sympy.Symbol, int] = {}
+    idx_to_sym: dict[int, sympy.Symbol] = {}
 
     assert grid is not None
 
-    def build_expr(node: Union[Intermediate, Param]):
+    INT_TO_PRED = {
+        0: lambda lhs, rhs: lhs == rhs,  # eq
+        1: lambda lhs, rhs: lhs != rhs,  # ne
+        2: lambda lhs, rhs: lhs < rhs,  # slt
+        3: lambda lhs, rhs: lhs <= rhs,  # sle
+        4: lambda lhs, rhs: lhs > rhs,  # sgt
+        5: lambda lhs, rhs: lhs >= rhs,  # sge
+        6: lambda lhs, rhs: lhs < rhs,  # ult
+        7: lambda lhs, rhs: lhs <= rhs,  # ule
+        8: lambda lhs, rhs: lhs > rhs,  # ugt
+        9: lambda lhs, rhs: lhs >= rhs,  # uge
+    }
 
+    def build_expr(node: Union[Intermediate, Param]) -> Any:
+        # print(node)
         if isinstance(node, Param):
-            return sympy.Symbol(f'p{node.idx}', integer=True)
+            param_name = arg_names[node.idx]
+            param_value = kwargs.get(param_name)
+
+            if isinstance(param_value, int):
+                return sympy.Integer(param_value)
+            elif isinstance(param_value, sympy.Expr):
+                return param_value
+
+            return ParamSymbol(f"p{node.idx}", node.idx)
         elif isinstance(node, Intermediate):
             op_list = ops.get(node)
 
             assert op_list is not None
             op = op_list[0]
+            name = op.name
 
-            if op.name == 'tt.addptr':
+            if name == "tt.splat":
+                return build_expr(op.args[0])
+            elif name == "arith.extsi":
+                return build_expr(op.args[0])
+
+            elif name == "tt.addptr":
                 ptr = build_expr(op.args[0])
                 offset = build_expr(op.args[1])
                 return ptr + offset
-            elif op.name == "arith.addi":
+            elif name == "arith.addi":
                 lhs = build_expr(op.args[0])
                 rhs = build_expr(op.args[1])
                 return lhs + rhs
-            elif op.name == "arith.muli":
+            elif name == "arith.muli":
                 lhs = build_expr(op.args[0])
                 rhs = build_expr(op.args[1])
                 return lhs * rhs
-            elif op.name == "tt.splat":
-                return build_expr(op.args[0])
-            elif op.name == "tt.get_program_id":
-                sym = sympy.Symbol(f'd{len(sym_meta) + 1}', integer=True, nonnegative=True)
-                axis = 0
-                end = grid[axis]
-                sym_meta[sym] = end
-                return sym
-            elif op.name == "tt.make_range":
-                sym = sympy.Symbol(f'd{len(sym_meta) + 1}', integer=True, nonnegative=True)
-                end = 1024
-                sym_meta[sym] = end
-                return sym
-            elif op.name == "arith.constant":
-                return sympy.Integer(1026)
+            elif name == "arith.cmpi":
+                pred_int = op.get_int_attr("predicate")
+                pred = INT_TO_PRED[pred_int]
+                lhs = build_expr(op.args[0])
+                rhs = build_expr(op.args[1])
+                return pred(lhs, rhs)
 
+            elif name == "tt.get_program_id":
+                axis = op.get_int_attr("axis")
+                bound = grid[axis]
+
+                sym = idx_to_sym.get(node.idx)
+                if sym is None:
+                    sym = sympy.Symbol(f"d{node.idx}")
+                    sym_to_val[sym] = bound
+                    idx_to_sym[node.idx] = sym
+
+                return sym
+            elif name == "tt.make_range":
+                end = op.get_int_attr("end")
+
+                sym = idx_to_sym.get(node.idx)
+                if sym is None:
+                    sym = sympy.Symbol(f"d{node.idx}")
+                    sym_to_val[sym] = end
+                    idx_to_sym[node.idx] = sym
+
+                return sym
+            elif name == "arith.constant":
+                value = op.get_int_attr("value")
+                return sympy.Integer(value)
+
+    reads: list[tuple[sympy.Expr, sympy.Expr | None]] = []
+    writes: list[tuple[sympy.Expr, sympy.Expr | None]] = []
+
+    # TODO[JJV]: Be conservative and fail/fallback when encountering
+    #   mutating ops which are not supported.
     for result, op_list in ops.items():
         for op in op_list:
             # print(f"  {result} = {op.name}({op.args})")
-            if op.name == 'tt.load':
+            if op.name == "tt.load":
                 # print(f"  {result} = {op.name}({op.args})")
-                ptr = build_expr(op.args[0])
-                # mask = (op.args[1])
-                print(f"{ptr=}")
-                print(sym_meta)
-            # if op.name == 'tt.store':
-            #     ptr = build_expr(op.args[0])
-            #     # mask = (op.args[1])
-            #     print(f"{ptr=}")
-            #     print(sym_meta)
-            #     # TODO: For now we will just consider `store`. 
-            #     # looking at 
-            #     print(op)
+                ptr_expr: sympy.Expr = build_expr(op.args[0])
+                mask_expr: sympy.Expr | None = None
+
+                if len(op.args) > 1:
+                    mask_expr = build_expr(op.args[1])
+
+                reads.append((ptr_expr, mask_expr))
+
+                print("tt.load:")
+                print(f"\t{ptr_expr=}")
+                print(f"\t{mask_expr=}")
+                print(f"\t{sym_to_val}")
+
+            if op.name == "tt.store":
+                # TODO: For now we will just consider `store`.
+                ptr_expr: sympy.Expr = build_expr(op.args[0])
+                mask_expr: sympy.Expr | None = None
+                if len(op.args) > 2:
+                    mask_expr = build_expr(op.args[2])
+
+                writes.append((ptr_expr, mask_expr))
+
+                print("tt.store:")
+                print(f"\t{ptr_expr=}")
+                print(f"\t{mask_expr=}")
+                print(f"\t{sym_to_val}")
+
+    return reads, writes, sym_to_val
 
 
 ###############################################################################
@@ -1322,7 +1494,6 @@ def get_mutated_tensors(
 ) -> list[str]:
     kernel = kernel_side_table.get_kernel(kernel_idx)
     constant_args = kernel_side_table.get_constant_args(constant_args_idx)
-    print("we get here, `get_mutated_tensors`")
     return identify_mutated_tensors(
         kernel, {**kwargs, **constant_args}, tma_descriptor_metadata
     )
@@ -1717,7 +1888,7 @@ class TritonHOPifier:
             kernel=variable.kernel,
             kernel_idx=variable.kernel_idx,
             grid=args[0],
-            attempt_fusion=variable.attempt_fusion
+            attempt_fusion=variable.attempt_fusion,
         )
 
     def call_run(
@@ -1734,7 +1905,10 @@ class TritonHOPifier:
         # rewrite kernel.run(*args, grid=grid) to kernel[grid](*args)
         return self.call_triton_kernel(
             type(variable)(
-                kernel=variable.kernel, kernel_idx=variable.kernel_idx, grid=grid, attempt_fusion=getattr(variable, "attempt_fusion", False)
+                kernel=variable.kernel,
+                kernel_idx=variable.kernel_idx,
+                grid=grid,
+                attempt_fusion=getattr(variable, "attempt_fusion", False),
             ),
             args,
             kwargs,
@@ -1836,7 +2010,12 @@ class TritonHOPifier:
             )(iter_kernel)
             # create a new variable to contain the new (wrapped) kernel;
             # skip kernel_idx to get a new record in the kernel side table
-            new_var = type(variable)(new_kernel, None, variable.grid, attempt_fusion=getattr(variable, "attempt_fusion", False))
+            new_var = type(variable)(
+                new_kernel,
+                None,
+                variable.grid,
+                attempt_fusion=getattr(variable, "attempt_fusion", False),
+            )
             return self.call_triton_kernel(new_var, args, kwargs, tx)
 
         SPECIAL_CONFIG_NAMES = {
@@ -1881,7 +2060,12 @@ class TritonHOPifier:
 
             # create a new variable to contain the new (wrapped) kernel;
             # skip kernel_idx to get a new record in the kernel side table
-            new_var = type(variable)(new_kernel, None, variable.grid, attempt_fusion=getattr(variable, "attempt_fusion", False))
+            new_var = type(variable)(
+                new_kernel,
+                None,
+                variable.grid,
+                attempt_fusion=getattr(variable, "attempt_fusion", False),
+            )
             return self.call_triton_kernel(new_var, args, kwargs, tx)
 
         if isinstance(variable.kernel, Autotuner):
@@ -1919,7 +2103,12 @@ class TritonHOPifier:
                     new_kernel = autotune(
                         configs=new_configs, prune_configs_by=prune_configs_by, key=[]
                     )(variable.kernel.fn)
-                    new_var = type(variable)(new_kernel, None, variable.grid, attempt_fusion=getattr(variable, "attempt_fusion", False))
+                    new_var = type(variable)(
+                        new_kernel,
+                        None,
+                        variable.grid,
+                        attempt_fusion=getattr(variable, "attempt_fusion", False),
+                    )
                     return self.call_triton_kernel(new_var, args, kwargs, tx)
 
         # These are the default values in upstream Triton
@@ -1979,7 +2168,12 @@ class TritonHOPifier:
             new_kernel = autotune(configs=pruned_configs, key=[])(variable.kernel.fn)
             # create a new variable to contain the new (wrapped) kernel;
             # skip kernel_idx to get a new record in the kernel side table
-            new_var = type(variable)(new_kernel, None, variable.grid, attempt_fusion=getattr(variable, "attempt_fusion", False))
+            new_var = type(variable)(
+                new_kernel,
+                None,
+                variable.grid,
+                attempt_fusion=getattr(variable, "attempt_fusion", False),
+            )
             return self.call_triton_kernel(new_var, args, kwargs, tx)
 
         # Both for grid's meta as well as for the kernel, we need combined
@@ -2182,7 +2376,7 @@ class TraceableTritonKernelWrapper:
         kernel: "TritonKernelType",
         kernel_idx: Optional[int],
         grid: Optional["TritonGridType"],
-        attempt_fusion: bool = False
+        attempt_fusion: bool = False,
     ) -> None:
         # pyrefly: ignore [bad-assignment]
         self.kernel = None
