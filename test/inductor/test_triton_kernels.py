@@ -3005,7 +3005,7 @@ class MutationTests(torch._inductor.test_case.TestCase):
             in_ptr0,
             in_ptr1,
             out_ptr,
-            n_elements,
+            n_elements: "tl.constexpr",
             BLOCK_SIZE: "tl.constexpr",
         ):
             pid = tl.program_id(axis=0)
@@ -3075,7 +3075,7 @@ class MutationTests(torch._inductor.test_case.TestCase):
             in_ptr0,
             in_ptr1,
             out_ptr,
-            n_elements,
+            n_elements: "tl.constexpr",
             BLOCK_SIZE: "tl.constexpr",
         ):
             pid = tl.program_id(axis=0)
@@ -3111,7 +3111,7 @@ class MutationTests(torch._inductor.test_case.TestCase):
             in_ptr0,
             in_ptr1,
             out_ptr,
-            n_elements,
+            n_elements: "tl.constexpr",
             BLOCK_SIZE: "tl.constexpr",
         ):
             pid = tl.program_id(axis=0)
