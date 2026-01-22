@@ -1238,7 +1238,6 @@ def analyze_access_patterns(
                     sym_to_val[sym] = bound
                     idx_to_sym[node.idx] = sym
                     sym_meta[sym] = f"tl.program_id({axis})"
-                    print(op)
 
                 return sym
             elif name == "tt.make_range":
@@ -1295,12 +1294,12 @@ def analyze_access_patterns(
                     )
                 )
 
-                print("tt.store:")
-                print(f"\t{ptr_expr=}")
-                print(f"\t{mask_expr=}")
-                print(f"\t{sym_to_val=}")
-                print(f"\t{op.operand_name=}")
-                print(f"\t{op.loc=}")
+                # print("tt.store:")
+                # print(f"\t{ptr_expr=}")
+                # print(f"\t{mask_expr=}")
+                # print(f"\t{sym_to_val=}")
+                # print(f"\t{op.operand_name=}")
+                # print(f"\t{op.loc=}")
 
     return AccessPatternAnalysis(
         reads=reads, writes=writes, sym_to_val=sym_to_val, sym_meta=sym_meta

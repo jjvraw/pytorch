@@ -2567,6 +2567,8 @@ class PythonWrapperCodegen(CodeGen):
                     cache_key.append(arg)
         cache_key.append(str(triton_meta))
         cache_key.extend(str(inductor_meta))
+        if modified_src is not None:
+            cache_key.append(modified_src)
         cache_key = tuple(cache_key)
         if cache_key in self.user_defined_kernel_cache:
             return (
@@ -2601,7 +2603,7 @@ class PythonWrapperCodegen(CodeGen):
 
         if modified_src:
             kernel_src = modified_src
-        else: 
+        else:
             kernel_src = user_defined_triton_kernel_transitive_closure_source_code(kernel)
 
         if config.triton.unique_user_kernel_names:

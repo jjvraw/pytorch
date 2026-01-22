@@ -275,7 +275,6 @@ def triton_op(
 
         triton_kernels = get_inner_triton_kernels(fn)
         triton_ops_to_kernels[name] = triton_kernels
-        print("inside triton_op", triton_ops_to_kernels)
         result.register_torch_dispatch(FunctionalTensorMode, functional_decomp)
         return result
 

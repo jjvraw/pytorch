@@ -7277,7 +7277,7 @@ class FusableUserDefinedTritonKernel(UserDefinedTritonKernel):
             index_str = str(index_expr)
 
             map_str = f"{{ [{iter_tuple}] -> [{index_str}] : {domain_str} }}"
-            print(map_str)
+            # print(map_str)
 
             return isl.Map(map_str), index_str
 
@@ -7464,7 +7464,7 @@ class FusableUserDefinedTritonKernel(UserDefinedTritonKernel):
             {},  # tma_descriptor_metadata
         )
 
-        print(f"{ttir_module=}")
+        # print(f"{ttir_module=}")
         # print(f"{ordered_tensor_names=}")
 
         functions = ttir_to_functions(ttir_module)

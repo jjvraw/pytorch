@@ -6016,6 +6016,7 @@ class TritonScheduling(SIMDScheduling):
         # Get epilogue SchedulerBuffer.
         epilogue_output_buf = epilogue_nodes[0].get_outputs()[0]
         epilogue_output_name = epilogue_output_buf.get_name()
+        print(epilogue_nodes)
 
         # Replace in kwargs.
         epilogue_ir_buf = epilogue_output_buf.node
