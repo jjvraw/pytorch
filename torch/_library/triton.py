@@ -10,6 +10,7 @@ from torch.utils._exposed_in import exposed_in
 from .custom_ops import custom_op, CustomOpDef
 from .infer_schema import infer_schema
 
+
 attempt_fusion_enabled = threading.local()
 attempt_fusion_enabled.attempt_fusion = False  # default
 
@@ -317,7 +318,7 @@ def capture_triton(triton_kernel: Callable, /) -> Any:
 @exposed_in("torch.library")
 def wrap_triton(
     triton_kernel: Callable, attempt_fusion: Optional[bool] = None, /
-    ) -> Any:
+) -> Any:
     """Allows capture of a triton kernel into a graph via make_fx or
     non-strict ``torch.export``.
 

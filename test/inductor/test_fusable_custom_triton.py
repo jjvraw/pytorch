@@ -1,25 +1,25 @@
-import torch
-import torch._dynamo.testing
-from torch.testing._internal import common_utils
-from torch._higher_order_ops.triton_kernel_wrap import AccessPatternAnalysis, identify_access_patterns
-import torch._inductor.utils
-import torch._inductor.test_case
-from torch.library import triton_op, wrap_triton
-
-from torch.testing._internal.triton_utils import *  # noqa: F403
 import triton
 import triton.language as tl
 
+import torch
+import torch._dynamo.testing
+import torch._inductor.test_case
+import torch._inductor.utils
 import torch.nn as nn
+from torch._higher_order_ops.triton_kernel_wrap import identify_access_patterns
+from torch.library import triton_op, wrap_triton
+from torch.testing._internal.triton_utils import *  # noqa: F403
+
 
 def compare_read_write_patterns(fn):
     @requires_gpu
     def test_fn(self):
-        from torch._higher_order_ops.triton_kernel_wrap import analyze_access_patterns
         import sympy
 
         kernel, inputs, grid, tma_descriptor_metadata, reads, writes = fn()
-        access_pattern = identify_access_patterns(kernel, inputs, tma_descriptor_metadata, grid)
+        access_pattern = identify_access_patterns(
+            kernel, inputs, tma_descriptor_metadata, grid
+        )
 
         def canonicalize(expr):
             if expr is None:
@@ -50,14 +50,11 @@ def compare_read_write_patterns(fn):
 
 
 class MutationTests(torch._inductor.test_case.TestCase):
-
     @compare_read_write_patterns
     def test_custom_gelu():
         import sympy
-        from torch._higher_order_ops.triton_kernel_wrap import (
-            ReadPattern,
-            WritePattern,
-        )
+
+        from torch._higher_order_ops.triton_kernel_wrap import ReadPattern, WritePattern
 
         @triton.jit
         def gelu_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
@@ -84,19 +81,29 @@ class MutationTests(torch._inductor.test_case.TestCase):
                 "x_ptr": t,
                 "output_ptr": t,
                 "n_elements": t.numel(),
-                "BLOCK_SIZE": BLOCK_SIZE
+                "BLOCK_SIZE": BLOCK_SIZE,
             },
             GRID,
             {},
-            [ReadPattern(ptr_expr=sympy.Symbol("p0") + 1024*sympy.Symbol("d0") + sympy.Symbol("d15"),
-                         mask_expr=1024*sympy.Symbol("d0") + sympy.Symbol("d15") < 65536)
+            [
+                ReadPattern(
+                    ptr_expr=sympy.Symbol("p0")
+                    + 1024 * sympy.Symbol("d0")
+                    + sympy.Symbol("d15"),
+                    mask_expr=1024 * sympy.Symbol("d0") + sympy.Symbol("d15") < 65536,
+                )
             ],
-            [WritePattern(ptr_expr=sympy.Symbol("p1") + 1024 * sympy.Symbol("d0") + sympy.Symbol("d15"),
-                          mask_expr=1024*sympy.Symbol("d0") + sympy.Symbol("d15") < 65536,
-                          loc=13,
-                          operand_name='output_ptr')
-            ])
-
+            [
+                WritePattern(
+                    ptr_expr=sympy.Symbol("p1")
+                    + 1024 * sympy.Symbol("d0")
+                    + sympy.Symbol("d15"),
+                    mask_expr=1024 * sympy.Symbol("d0") + sympy.Symbol("d15") < 65536,
+                    loc=13,
+                    operand_name="output_ptr",
+                )
+            ],
+        )
 
 
 @triton_op("mine::gelu", mutates_args={}, attempt_fusion=True)
@@ -108,6 +115,7 @@ def custom_gelu_triton(x: torch.Tensor) -> torch.Tensor:
     wrap_triton(gelu_kernel)[GRID](x, output, n_elements, BLOCK_SIZE=BLOCK_SIZE)
 
     return output
+
 
 @triton.jit
 def gelu_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
@@ -124,11 +132,12 @@ def gelu_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
 
     tl.store(output_ptr + offsets, gelu_result, mask=mask)
 
+
 class FusionBlockedMLP(nn.Module):
     def __init__(self, dim=1024):
         super().__init__()
-        self.linear1 = nn.Linear(dim, 4*dim)
-        self.linear2 = nn.Linear(4*dim, dim)
+        self.linear1 = nn.Linear(dim, 4 * dim)
+        self.linear2 = nn.Linear(4 * dim, dim)
 
     def forward(self, x):
         x = self.linear1(x)
@@ -136,6 +145,7 @@ class FusionBlockedMLP(nn.Module):
         x = x * 0.5
         x = self.linear2(x)
         return x
+
 
 class PointwiseChain(nn.Module):
     def __init__(self):
@@ -153,7 +163,6 @@ class PointwiseChain(nn.Module):
 
 
 class AccuracyTests(torch._inductor.test_case.TestCase):
-
     def test_fusion_blocked_mlp(self):
         device = torch.device("cuda")
         model = FusionBlockedMLP().to(device).eval()
@@ -183,6 +192,7 @@ class AccuracyTests(torch._inductor.test_case.TestCase):
                 compiled_out = compiled(x)
 
         self.assertEqual(model_out, compiled_out)
+
 
 # common_utils.instantiate_parametrized_tests(MutationTests)
 

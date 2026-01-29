@@ -47,7 +47,7 @@ from .comm_analysis import (
     estimate_nccl_collective_runtime,
     estimate_nccl_collective_runtime_nccl_estimator,
 )
-from .dependencies import Dep, MemoryDep, StarDep, WeakDep
+from .dependencies import Dep, MemoryDep, StarDep, UserTritonDep, WeakDep
 from .exc import GPUTooOldForTriton, TritonMissing
 from .fx_utils import count_flops_fx
 from .ir import (
@@ -104,6 +104,8 @@ class TritonBinding:
     store_locs: dict[str, int]
     buf_to_access: dict[str, tuple[str, str]]
     output_buf_to_argname: dict[str, str]
+    store_varnames: dict[str, str]
+    store_buffers: dict[str, ComputedBuffer]
 
 
 class MixOrderReduction:
@@ -1970,64 +1972,61 @@ class FusedSchedulerNode(BaseSchedulerNode):
                     ),
                 ]
             )
-        elif node1.is_fusable_user_triton() and isinstance(node2, SchedulerNode):
+        elif node1.is_fusable_user_triton() and isinstance(node2, (SchedulerNode, FusedSchedulerNode)):
+            assert not isinstance(node1, FusedSchedulerNode) # TODO[JJV]: Will need to handle FusedSchedulerNode differently.
+            epilogue_nodes = node2.get_nodes()
+            mutation_real_name = node1.scheduler.mutation_real_name
+
             node1_write_names = {
                 node1.scheduler.mutation_real_name.get(dep.name, dep.name): dep
                 for dep in node1.read_writes.writes
             }
-            node2_read_names = OrderedSet(
-                [
-                    node2.scheduler.mutation_real_name.get(dep.name, dep.name)
-                    for dep in node2.read_writes.reads
-                ]
-            )
-            intermediate_buffers = node1_write_names.keys() & node2_read_names
-            assert len(intermediate_buffers) == 1, "Only single buffer fusion supported"
 
-            # Intermediate depedencies represent outputs from node1, which are
-            # intermediate stores within the user's kernel.
-            buf_to_varname = {
-                name: node1_write_names[name].operand_name
-                for name in intermediate_buffers
-            }
-            store_locs = {
-                name: node1_write_names[name].loc for name in intermediate_buffers
-            }
-            # print(f"{buf_to_varname=}")
-            # print(f"{store_locs=}")
+            buf_to_varname = {}
+            store_varnames = {}
+            store_buffers = {}
+            store_locs = {}
 
-            # We now need to store the new writing pattern for the correct buffer.
-            # That is the output buffer of the epilogue.
-            # For now we are just working with a pointwise/bijective epilogue kernel.
-            write_dep = next(iter(node1.read_writes.writes))
-            write_access = write_dep.index_str
-            mask = write_dep.mask
-            for sym, triton_expr in node1.node.sym_meta.items():
-                write_access = write_access.replace(str(sym), f"{triton_expr}")
-                mask = str(mask).replace(str(sym), f"{triton_expr}")
+            for epilogue in epilogue_nodes:
+                node2_read_names = {
+                        mutation_real_name.get(dep.name, dep.name): dep
+                        for dep in epilogue.read_writes.reads
+                }
 
-            buf_to_access = {}
-            intermediate_buf = next(iter(intermediate_buffers))
+                intermediate_buffers = node1_write_names.keys() & node2_read_names.keys()
+                print(f"{node1_write_names=}")
+                print(f"{node2_read_names=}")
+                print(f"{intermediate_buffers=}")
+                print()
 
-            output_buf_to_argname = {}
-            for dep in node2.read_writes.writes:
-                epilogue_output_buf = node2.scheduler.mutation_real_name.get(
-                    dep.name, dep.name
-                )
-                buf_to_access[epilogue_output_buf] = (write_access, mask)
+                # Intermediate buffers represent the "buffers-to-remove". These intermediary
+                # stores (node1) and loads (node2) are to be forwarded, by inlining the compute
+                # bodies of epilogue kernels (node2).
 
-                # Single buffer case - map to the one intermediate buffer
-                user_output_argname = node1_write_names[intermediate_buf].arg_name
-                output_buf_to_argname[epilogue_output_buf] = user_output_argname
+                # Within the user's kernel, we need to obtain the local variable name
+                # associated with written-to buffer. We then cache this variable name within
+                # CSE[TritonCSEVariable] for codegen.
+                for name in intermediate_buffers:
+                    buf_to_varname[name] = node1_write_names[name].operand_name # type: ignore
+                    epilogue_write = epilogue.read_writes.writes
+                    assert len(epilogue_write) == 1
+                    epilogue_write_dep = next(iter(epilogue_write))
+                    store_varnames[epilogue_write_dep.name] = node1_write_names[name].operand_name # type: ignore
+                    store_locs[epilogue_write_dep.name] = node1_write_names[name].loc # type: ignore
+                    store_buffers[node1_write_names[name].arg_name] = epilogue.get_output(epilogue_write_dep.name).node # type: ignore
 
-            # print(f"{output_buf_to_argname=}")
+
+            print(f"{store_buffers=}")
+            print(f"{store_varnames=}")
             nodes = list(itertools.chain(node1.get_nodes(), node2.get_nodes()))
             fused_node = cls(node1.scheduler, nodes)
             fused_node.triton_binding = TritonBinding(
                 buf_to_varname=buf_to_varname,
                 store_locs=store_locs,
-                buf_to_access=buf_to_access,
-                output_buf_to_argname=output_buf_to_argname,
+                store_varnames=store_varnames,
+                buf_to_access={},
+                output_buf_to_argname={},
+                store_buffers=store_buffers
             )
 
             return fused_node
@@ -5325,15 +5324,8 @@ class Scheduler:
             why("template epilogue not satisfied")
             return False
 
-        # TODO: Early rejections for fusable user triton.
-        # Perhaps we can do something like
-        # if (nodeX.is_template() or nodeX.is_fusable_user_triton()) ...
-        # and fall under the epilogue/prologue fusion conditions above.
-        if node1.is_fusable_user_triton():
-            pass
-
-        if node2.is_fusable_user_triton():
-            pass
+        if node1.is_fusable_user_triton() or node2.is_fusable_user_triton():
+            return self.can_fuse_user_defined_triton(node1, node2)
 
         if (node1.get_buffer_names() & V.graph.no_fuse_buffer_names) or (
             node2.get_buffer_names() & V.graph.no_fuse_buffer_names
@@ -5352,9 +5344,8 @@ class Scheduler:
         )
         assert isinstance(shared_data_score, int)
 
-        # TODO[JJV]: There may be a better way here...
-        if node1.is_fusable_user_triton():
-            shared_data_score = 1
+        # TODO[JJV]: Worry about scoring fusable_user_triton later?
+        # maybe delay after scoring, give custom ops low score?
 
         if (
             can_reorder
@@ -5393,15 +5384,11 @@ class Scheduler:
 
         if not V.choices.can_fuse(self, node1, node2, shared_data_score):
             return False
-        # print(self.get_backend(device))
-
-        if node1.is_fusable_user_triton() or node2.is_fusable_user_triton():
-            return self.can_fuse_user_defined_triton(node1, node2)
 
         if node1.get_operation_names() & node2.ancestors:
             # node2 depends on node1 outputs
             return (
-                self.can_fuse_vertical(node1, node2)
+                self.can_fuse_vertical(node1, node2, self.fusable_read_and_write)
                 and V.choices.can_fuse_vertical(self, node1, node2, shared_data_score)
                 and self.get_backend(device).can_fuse_vertical(node1, node2)
             )
@@ -5424,9 +5411,6 @@ class Scheduler:
         why = WhyNoFuse(node1, node2)
         remaining_deps_by_name: dict[str, list[Dep]] = defaultdict(list)
 
-        # print(self.mutation_renames)
-        # print(self.mutation_real_name)
-
         # Gather node2's unmet dependencies, group them by buffer name.
         # Exclude ordering constraints, i.e. WeakDeps.
         for dep in node2.unmet_dependencies:
@@ -5436,7 +5420,7 @@ class Scheduler:
             remaining_deps_by_name[name].append(dep)
 
         for cd in node1.read_writes.writes:
-            if not isinstance(cd, MemoryDep):
+            if not isinstance(cd, (MemoryDep, UserTritonDep)):
                 continue
             remaining = remaining_deps_by_name.get(
                 self.mutation_renames.get(cd.name, cd.name)
@@ -5519,8 +5503,12 @@ class Scheduler:
     # However, broadcasting sometimes strips dimensions, and if that's the case
     # we still can match unmet dep
     # if there's indirect indexing, don't match it
-    def fusable_read_and_write(self, read: Dep, write: MemoryDep) -> bool:
-        if isinstance(read, MemoryDep):
+    def fusable_read_and_write(self, read: Dep, write: Dep) -> bool:
+        if isinstance (write, UserTritonDep):
+            assert isinstance(read, MemoryDep)
+            return self.has_compatible_access_pattern(write, read)
+        elif isinstance(read, MemoryDep):
+            assert isinstance(write, MemoryDep)
             read_name = self.mutation_renames.get(read.name, read.name)
 
             if (
@@ -5543,6 +5531,7 @@ class Scheduler:
                 and read.size[: len(write.size)] == write.size
             )
         elif isinstance(read, StarDep):
+            assert isinstance(write, MemoryDep)
             read_name = self.mutation_renames.get(read.name, read.name)
             write_name = self.mutation_renames.get(write.name, write.name)
             if (
@@ -5553,11 +5542,57 @@ class Scheduler:
                 return True
         return False
 
+
+    def has_compatible_access_pattern(self, user_dep: UserTritonDep, scheduler_dep: MemoryDep) -> bool:
+        import islpy as isl
+
+        constraints = []
+        for var, size in zip(scheduler_dep.var_names, scheduler_dep.size):
+            constraints.append(f"0 <= {var} < {size}")
+
+        constraints_str = " and ".join(constraints)
+        domain_vars = ", ".join(str(v) for v in scheduler_dep.var_names)
+        index_expr = str(scheduler_dep.index)
+        map_str = f"{{ [{domain_vars}] -> [addr] : addr = {index_expr} and {constraints_str} }}"
+        scheduler_map = isl.Map(map_str)
+
+        user_map = user_dep.access_map
+
+        return user_map.range().is_equal(scheduler_map.range()) and \
+        user_map.apply_range(scheduler_map.reverse()).is_bijective()
+
     def can_fuse_user_defined_triton(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
-        # TODO[JJV]
-        return True
+
+
+        print("Inside can_fuse_user_defined_triton")
+
+        # Prologue fusion not supported.
+        if node2.is_fusable_user_triton():
+            return False
+
+        if node2.is_reduction() and node2.is_template():
+            return False
+
+        assert isinstance(node1, FusableUserDefinedKernelSchedulerNode)
+        return self.can_fuse_vertical(node1, node2)
+
+        # node1_write_names = {
+        #    self.mutation_real_name.get(dep.name, dep.name): dep
+        #     for dep in node1.read_writes.writes
+        # }
+        #
+        # for epilogue in node2.get_nodes():
+        #     node2_read_names = {
+        #         self.mutation_real_name.get(dep.name, dep.name): dep
+        #             for dep in epilogue.read_writes.reads
+        #     }
+        #     intermediate_buffers = node1_write_names.keys() & node2_read_names.keys()
+
+            # for name in intermediate_buffers:
+                # if not has_compatible_access_pattern(node1_write_names[name], node2_read_names[name]):
+            #         return False
 
     def dep_size_hint(self, dep: Dep, count_bytes: bool = True) -> int:
         return V.graph.get_dep_size_hint(dep, count_bytes)

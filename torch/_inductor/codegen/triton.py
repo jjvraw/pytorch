@@ -57,6 +57,7 @@ from ..scheduler import (
     Scheduler,
     SchedulerBuffer,
     SchedulerNode,
+    TritonBinding,
 )
 from ..shape_propagation import get_broadcasted_shape
 from ..utils import (
@@ -154,6 +155,12 @@ def is_sympy_integer_like(expr: object):
     return isinstance(expr, sympy.Integer) or (
         expr.is_integer and len(expr.free_symbols) == 0
     )
+
+
+# @dataclasses.dataclass
+# class FusionContext:
+#
+#     buf_to_intermediate
 
 
 class OpDtypeSupport:
@@ -5971,26 +5978,6 @@ class TritonScheduling(SIMDScheduling):
         return code_buffer.getvalue()
 
     def codegen_fusable_user_defined_triton_kernel(self, scheduler_node):
-        from ..virtualized import V
-
-        assert isinstance(scheduler_node, FusedSchedulerNode)
-
-        nodes = scheduler_node.get_nodes()
-
-        user_defined_scheduler_node = nodes[0]
-        assert isinstance(
-            user_defined_scheduler_node, FusableUserDefinedKernelSchedulerNode
-        )
-
-        iir_node = user_defined_scheduler_node.node
-        assert isinstance(iir_node, ir.FusableUserDefinedTritonKernel)
-        assert iir_node is not None  # For LSP
-
-        kernel_wrapper = iir_node.make_kernel_render()
-
-        # Remaning nodes are epilogue nodes
-        epilogue_nodes = [n for n in nodes[1:] if isinstance(n, SchedulerNode)]
-
         # Triton kernels do not return an output, but rather mutate arguments.
         # However, this is somewhat represented as an output in the dep-graph.
 
@@ -6001,96 +5988,48 @@ class TritonScheduling(SIMDScheduling):
         #       (2) redirect the user-kernel with (1)'s buffer.
         #           this is apart of the mutated buffers of the user-kernels.
         #       (3) mark intermediate buffers as removed, so they're not allocated.
+        from ..virtualized import V
 
-        user_kernel_output_buf = user_defined_scheduler_node.get_outputs()[0]
-        assert isinstance(user_kernel_output_buf, SchedulerBuffer), (
-            f"{type(user_kernel_output_buf)}"
-        )
+        assert isinstance(scheduler_node, FusedSchedulerNode) # TODO[JJV]: Change into if case when no fusion. 
+        assert scheduler_node.triton_binding is not None
 
-        # Get mutable arguments of user-kernel. These are in the form of TensorBox.
-        # For our example we only have one argument/buffer that is mutated.
-        assert len(iir_node.mutable_args) == 1
-        mutated_buffer_name = iir_node.mutable_args[0].get_name()
-        assert isinstance(iir_node.mutable_args[0], ir.TensorBox)
 
-        # Get epilogue SchedulerBuffer.
-        epilogue_output_buf = epilogue_nodes[0].get_outputs()[0]
-        epilogue_output_name = epilogue_output_buf.get_name()
-        print(epilogue_nodes)
-
-        # Replace in kwargs.
-        epilogue_ir_buf = epilogue_output_buf.node
-        # TODO: I dont like the way this is done. Perhaps we add some mapping to the iir_node
-        #       during initialisation or analysis.
-        for key, value in iir_node.kwargs.items():
-            # TODO: Is there a case where an IRNode for Triton kernel will not have this implemented?
-            if isinstance(value, IRNode) and value.get_name() == mutated_buffer_name:
-                iir_node.kwargs[key] = epilogue_ir_buf
+        nodes = scheduler_node.get_nodes()
+        anchor_idx = -1
+        for i, node in enumerate(nodes):
+            if isinstance(node, FusableUserDefinedKernelSchedulerNode):
+                anchor_idx = i
                 break
-        else:
-            assert False
+        assert anchor_idx != -1
 
-        # Mark intermediate buffers as removed
-        kernel_wrapper.removed_buffers.add(mutated_buffer_name)  # buf1
-        kernel_wrapper.removed_buffers.add(user_kernel_output_buf.get_name())  # buf2
+        prologue_nodes = list(nodes[:anchor_idx])
+        anchor_node = nodes[anchor_idx]
+        anchor_iir_node = anchor_node.node
+        epilogue_nodes = list(nodes[anchor_idx + 1:])
 
-        # Currently, the render() function and hooks are hardcoded for the
-        # specific GeLU + scale example. A general implementation would need
-        # to introspect both the user-defined and epilogue bodies and codegen the
-        # appropriate Triton code.
-        # with kernel_wrapper:
-        #     partial_code = render()
-        #     partial_code.finalize_hook("<KERNEL_BODY>")
-        #     print(partial_code.code)
-        #     partial_code.finalize_hook("<EPILOGUE_FUSION>", modded_src)
-        #
-        #     src_code = partial_code.code
+        ptk = PartialTritonKernel(self,
+                                  anchor_node,
+                                  prologue_nodes,
+                                  epilogue_nodes,
+                                  262144,
+                                  scheduler_node.triton_binding # type: ignore
+                                  )
 
-        # Get original source
-        original_src = kernel_wrapper.jit_kernel.src
-        store_line_num = next(iter(scheduler_node.triton_binding.store_locs.values()))
-        lines = original_src.splitlines()
-        lines.pop(store_line_num)
-        original_src = "\n".join(lines)
-        epilogue_code = self._extract_epilogue_compute(
-            iir_node, epilogue_nodes[0], scheduler_node.triton_binding
-        )
+        # print(epilogue_nodes[0].get_ranges())
+        print(ptk.codegen_epilogue())
 
-        src_code = original_src + "\n" + epilogue_code
-        print(src_code)
+        removed_buffers = OrderedSet()
+        for arg_name, epilogue_ir_buf in scheduler_node.triton_binding.store_buffers.items():
+            input_buf_name = anchor_iir_node.kwargs[arg_name].get_name()
+            mutated_in_buf_name = anchor_iir_node.mutation_renames[input_buf_name]
+            removed_buffers.add(input_buf_name)
+            removed_buffers.add(mutated_in_buf_name)
+            anchor_node.node.kwargs[arg_name] = epilogue_ir_buf
 
-        # kernel_wrapper.jit_kernel.__dict__['src'] = src_code
-        # kernel_wrapper.jit_kernel.src = src_code
-        wrapper = V.graph.wrapper_code
-        user_kernel = kernel_wrapper.user_defined_kernel
 
-        (
-            kernel_name,
-            triton_meta,
-            extra_launch_args,
-        ) = wrapper.define_user_defined_triton_kernel(
-            kernel_wrapper.jit_kernel,
-            kernel_wrapper.configs,
-            user_kernel.kwargs,
-            kernel_wrapper.restore_value_args,
-            kernel_wrapper.reset_to_zero_args,
-            user_kernel.grid,
-            src_code,  # TODO: CHECK THIS LOGIC !!!!
-        )
-
-        kernel_wrapper.kernel_name = kernel_name
-        kernel_wrapper.extra_launch_args = extra_launch_args
-
-        with V.set_kernel_handler(kernel_wrapper):
-            for node in scheduler_node.get_nodes():
-                node.mark_run()
-
-        # kernel_wrapper.call_kernel(kernel_name, scheduler_node)
-        kernel_wrapper.call_kernel(kernel_name)
-
-        V.graph.removed_buffers |= kernel_wrapper.removed_buffers
-        V.graph.inplaced_to_remove |= kernel_wrapper.inplaced_to_remove
-        self.free_buffers_in_scheduler()
+        ptk.removed_buffers = removed_buffers
+        ptk.emit_kernel()
+            
 
     def codegen_comment(self, node_schedule, kernel_name=None):
         wrapper = V.graph.wrapper_code
@@ -6504,3 +6443,222 @@ def debug_triton_code(node: BaseSchedulerNode) -> list[str]:
         lines.append(f"{node.get_name()} Triton code:")
         lines.append(textwrap.indent(triton_code, "    "))
     return lines
+
+
+class PartialTritonKernel(TritonKernel):
+    def __init__(
+        self,
+        scheduler: TritonScheduling,
+        anchor_node: FusableUserDefinedKernelSchedulerNode,
+        prologue_nodes: list[BaseSchedulerNode],
+        epilogue_nodes: list[BaseSchedulerNode],
+        numel: int,
+        triton_binding: TritonBinding
+    ):
+        from .simd_kernel_features import SIMDKernelFeatures
+
+        self.scheduler = scheduler
+        self.anchor_node = anchor_node
+        self.anchor_iir_node = anchor_node.node
+        self.prologue_nodes = prologue_nodes
+        self.epilogue_nodes = epilogue_nodes
+
+        numel_sympy = sympy.Integer(numel)
+        all_nodes = prologue_nodes + epilogue_nodes
+        features = SIMDKernelFeatures(
+            node_schedule=all_nodes,  # type: ignore
+            numel=numel_sympy,
+        )
+        tiling = {"x": numel_sympy}
+
+        super().__init__(
+            tiling=tiling,  # type: ignore
+            features=features,
+            # Disable features we don't need
+            override_persistent_reduction=False,
+            override_cooperative_reduction=False,
+        )
+
+        self.triton_binding = triton_binding
+
+        self.jit_kernel, self.configs, self.restore_value_args, self.reset_to_zero_args = (
+            self.anchor_node.node.get_kernel_and_metadata() # type: ignore
+        )
+
+        self.src_code = ""
+        self._make_kernel_render()
+
+        self.removed_buffers = OrderedSet()
+        self.inplaced_to_remove = OrderedSet()
+        self.kernel_name = "" 
+        self.extra_launch_args = []
+
+
+    def emit_kernel(self):
+        wrapper = V.graph.wrapper_code
+        user_kernel = self.anchor_node
+
+        (
+            self.kernel_name,
+            self.triton_meta,
+            self.extra_launch_args,
+        ) = wrapper.define_user_defined_triton_kernel(
+            self.jit_kernel,
+            self.configs,
+            self.anchor_iir_node.kwargs,
+            self.restore_value_args,
+            self.reset_to_zero_args,
+            self.anchor_iir_node.grid,
+            self.src_code,  # TODO[JJV]: CHECK THIS LOGIC !!!!
+        )
+
+
+        for node in itertools.chain(self.prologue_nodes,
+                                    [self.anchor_node],
+                                    self.epilogue_nodes):
+
+            node.mark_run()
+
+        self.generate_kernel_call()
+
+        V.graph.removed_buffers |= self.removed_buffers
+        V.graph.inplaced_to_remove |= self.inplaced_to_remove
+        self.scheduler.free_buffers_in_scheduler()
+
+    def generate_kernel_call(self):
+        from torch._inductor.utils import triton_version_uses_attrs_dict
+
+        wrapper = V.graph.wrapper_code
+        user_kernel = self.anchor_iir_node
+
+        named_args = {
+            k: user_kernel.get_kwargs_value(k)
+            for k in user_kernel.ordered_kwargs_for_cpp_kernel
+        }
+
+        constexpr_names = OrderedSet(
+            self.jit_kernel.arg_names[i] for i in self.jit_kernel.constexprs
+        )
+
+        # Process arguments as UserDefinedTritonKernel.codegen
+        args: list[Any] = []
+        arg_types: list[Any] = []
+        raw_keys_filtered: list[Any] = []
+        raw_args_filtered: list[Any] = []
+
+        for arg_name, arg in itertools.chain(
+            named_args.items(),
+            zip(itertools.repeat(""), self.extra_launch_args),
+        ):
+            if arg_name in constexpr_names and triton_version_uses_attrs_dict():
+                continue
+
+            raw_keys_filtered.append(arg_name)
+            raw_args_filtered.append(arg)
+
+            if isinstance(arg, IRNode):
+                args.append(arg.codegen_reference())
+                arg_types.append(arg.get_dtype())
+            elif isinstance(arg, (int, float, bool, sympy.Expr)):
+                args.append(arg)
+                arg_types.append(type(arg))
+            elif arg_name in constexpr_names:
+                args.append(-1)
+                arg_types.append(int)
+            elif arg is None:
+                if triton_version_uses_attrs_dict():
+                    args.append(-1)
+                    arg_types.append(int)
+                else:
+                    raw_keys_filtered.pop()
+                    raw_args_filtered.pop()
+            else:
+                raise NotImplementedError(f"Unsupported arg type: {type(arg)}: {arg}")
+
+        wrapper.generate_kernel_call(
+            self.kernel_name,
+            args,
+            arg_types=arg_types,
+            raw_args=raw_args_filtered,
+            raw_keys=raw_keys_filtered,
+            triton=True,
+            device=user_kernel.get_device(),
+            original_fxnode_name=user_kernel.fx_node.name,
+        )
+
+        
+        
+    def _make_kernel_render(self):
+        from ..select_algorithm import PartialRender
+
+        kernel_src = self.jit_kernel.src.splitlines()
+
+        sorted_locs = sorted(self.triton_binding.store_locs.items(), 
+                     key=lambda x: x[1], reverse=True)
+
+        self.epilogue_indents = {}
+        replacement_hooks = {}
+        for buf, loc in sorted_locs: 
+            placeholder = f"<EPILOGUE_{buf}>"
+            replacement_hooks[placeholder] = None
+
+            original_line = kernel_src[loc]
+            indent = len(original_line) - len(original_line.lstrip())
+            self.epilogue_indents[buf] = indent
+            
+            kernel_src.insert(loc - 1, placeholder)
+
+        modified_src = '\n'.join(kernel_src)
+
+        self.render = PartialRender(code=modified_src,
+                               replacement_hooks=replacement_hooks)
+
+
+        print(self.render.code)
+
+    def codegen_epilogue(self):
+        
+        with self:
+
+            for buf, varname in self.triton_binding.buf_to_varname.items():
+                self.cse.store_cache[buf] = self.cse.namedvar(
+                    varname,
+                    bounds=ValueRanges.unknown(),
+                    dtype=torch.float32,
+                    shape=("")
+                )
+
+            for node in self.epilogue_nodes:
+                index_vars = self.split_and_set_ranges(node.get_ranges())
+
+                node.codegen(index_vars)
+
+        print(f"{self.compute.getvalue()=}")
+        print(f"{self.stores.getvalue()=}")
+
+        self.render.finalize_all() # TODO[JJV]: We will move this away when introducing prologues.
+        self.src_code = self.render.code
+        print(self.render.code)
+    
+    def store(self, name: str, index: sympy.Expr, value: CSEVariable, mode=None):
+        """
+        Typically we would want to use `DeferredLine` to remove intermediary stores.
+        In this case 
+        """        
+        if name in self.triton_binding.store_varnames:
+            input_var = self.triton_binding.store_varnames[name]
+            self.compute.writeline(f"{input_var} = {value.name}")
+
+            # I really do not like this workaround.
+            indent_spaces = self.epilogue_indents[name]
+
+            def indented_compute():
+                code = self.compute.getvalue()
+                lines = code.splitlines()
+                return '\n'.join(' ' * indent_spaces + line for line in lines)
+
+
+            self.render.replacement_hooks[f"<EPILOGUE_{name}>"] = indented_compute
+            return
+
+        raise
