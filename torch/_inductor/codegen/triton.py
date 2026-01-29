@@ -157,12 +157,6 @@ def is_sympy_integer_like(expr: object):
     )
 
 
-# @dataclasses.dataclass
-# class FusionContext:
-#
-#     buf_to_intermediate
-
-
 class OpDtypeSupport:
     """
     Some Triton ops such as libdevice and tl.math only support float32 and float64.
@@ -5894,88 +5888,6 @@ class TritonScheduling(SIMDScheduling):
                 [*cls.backend_features, BackendFeature.REDUCE_TO_SINGLE_ELEMENT]
             )
         return cls.backend_features
-
-    def _extract_epilogue_compute(self, prologue_node, epilogue_node, triton_binding):
-        from torch._inductor.codegen.common import IndentedBuffer
-        from torch._inductor.codegen.triton import TritonOverrides
-
-        class CodeCapturingOps(TritonOverrides):
-            def __init__(self, buffer, buf_to_varname, buf_to_argname, buf_to_access):
-                self.buffer = buffer
-                self.buffer._code_buffer = 1
-                self.tmp_counter = 0
-                self.idx_counter = 0
-                self.mask_counter = 0
-                self.buf_to_varname = buf_to_varname
-                self.buf_to_argname = buf_to_argname
-                self.buf_to_access = buf_to_access
-
-                self.buffer.writeline("# ==== Begin of Epilogue Codegen =====")
-                self.buffer.writeline("")
-
-            def load(self, name, index):
-                if name in self.buf_to_varname.keys():
-                    var = self.buf_to_varname[name]
-                else:
-                    # TODO[JJV] If we are raising we might as well try...catch with direct index?
-                    raise
-
-                return var
-
-            def store(self, name, index, value, mode):
-                if name in self.buf_to_argname:
-                    # Store value as a variable
-                    var = f"tmp{self.tmp_counter}"
-                    self.tmp_counter += 1
-                    self.buffer.writeline(f"{var} = {value}")
-
-                    # Store pointer access as variable
-                    access = self.buf_to_access[name][0]
-                    idx_var = f"idx{self.idx_counter}"
-                    self.idx_counter += 1
-                    self.buffer.writeline(f"{idx_var} = {access}")
-
-                    # Store mask as variable
-                    mask = self.buf_to_access[name][1]
-                    mask_arg = ""
-                    if mask:
-                        msk_var = f"msk{self.mask_counter}"
-                        self.mask_counter += 1
-                        self.buffer.writeline(f"{msk_var} = {mask}")
-                        mask_arg = f", mask={msk_var}"
-
-                    arg_name = self.buf_to_argname[name]
-                    self.buffer.writeline(
-                        f"tl.store({arg_name} + {idx_var}, {var}{mask_arg})"
-                    )
-
-                    return value
-                else:
-                    raise ValueError(f"Cannot store to unknown buffer {name}")
-
-        code_buffer = IndentedBuffer(initial_indent=1)
-        ops = CodeCapturingOps(
-            code_buffer,
-            triton_binding.buf_to_varname,
-            triton_binding.output_buf_to_argname,
-            triton_binding.buf_to_access,
-        )
-
-        # Get the actual index variables from the sizes
-        # sizes is a tuple of sequences
-        index_vars = []
-        for size_group in epilogue_node._sizes:
-            group_vars = [sympy.Symbol(f"idx{i}") for i in range(len(size_group))]
-            index_vars.append(group_vars)
-
-        # Call with the properly structured index vars
-        with V.set_ops_handler(ops):
-            epilogue_node._body(*index_vars)
-
-        code_buffer.writeline("")
-        code_buffer.writeline("# ==== End of Epilogue Codegen =====")
-
-        return code_buffer.getvalue()
 
     def codegen_fusable_user_defined_triton_kernel(self, scheduler_node):
         # Triton kernels do not return an output, but rather mutate arguments.
