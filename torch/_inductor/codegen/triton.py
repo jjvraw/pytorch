@@ -5890,6 +5890,7 @@ class TritonScheduling(SIMDScheduling):
         return cls.backend_features
 
     def codegen_fusable_user_defined_triton_kernel(self, scheduler_node):
+        from torch._inductor.utils import sympy_product
         # Triton kernels do not return an output, but rather mutate arguments.
         # However, this is somewhat represented as an output in the dep-graph.
 
@@ -5902,7 +5903,7 @@ class TritonScheduling(SIMDScheduling):
         #       (3) mark intermediate buffers as removed, so they're not allocated.
         from ..virtualized import V
 
-        assert isinstance(scheduler_node, FusedSchedulerNode) # TODO[JJV]: Change into if case when no fusion. 
+        assert isinstance(scheduler_node, FusedSchedulerNode) # TODO[JJV]: Change into if case when no fusion.
         assert scheduler_node.triton_binding is not None
 
 
@@ -5919,11 +5920,14 @@ class TritonScheduling(SIMDScheduling):
         anchor_iir_node = anchor_node.node
         epilogue_nodes = list(nodes[anchor_idx + 1:])
 
+        iteration_sizes = anchor_node.get_ranges()[0]  # First tuple = pointwise dims
+        numel = sympy_product(iteration_sizes)
+        print("NUMELLLLLLLL_____", numel)
         ptk = PartialTritonKernel(self,
                                   anchor_node,
                                   prologue_nodes,
                                   epilogue_nodes,
-                                  262144,
+                                  numel,
                                   scheduler_node.triton_binding # type: ignore
                                   )
 
@@ -5941,7 +5945,7 @@ class TritonScheduling(SIMDScheduling):
 
         ptk.removed_buffers = removed_buffers
         ptk.emit_kernel()
-            
+
 
     def codegen_comment(self, node_schedule, kernel_name=None):
         wrapper = V.graph.wrapper_code
@@ -6402,7 +6406,7 @@ class PartialTritonKernel(TritonKernel):
 
         self.removed_buffers = OrderedSet()
         self.inplaced_to_remove = OrderedSet()
-        self.kernel_name = "" 
+        self.kernel_name = ""
         self.extra_launch_args = []
 
 
@@ -6498,26 +6502,26 @@ class PartialTritonKernel(TritonKernel):
             original_fxnode_name=user_kernel.fx_node.name,
         )
 
-        
-        
+
+
     def _make_kernel_render(self):
         from ..select_algorithm import PartialRender
 
         kernel_src = self.jit_kernel.src.splitlines()
 
-        sorted_locs = sorted(self.triton_binding.store_locs.items(), 
+        sorted_locs = sorted(self.triton_binding.store_locs.items(),
                      key=lambda x: x[1], reverse=True)
 
         self.epilogue_indents = {}
         replacement_hooks = {}
-        for buf, loc in sorted_locs: 
+        for buf, loc in sorted_locs:
             placeholder = f"<EPILOGUE_{buf}>"
             replacement_hooks[placeholder] = None
 
             original_line = kernel_src[loc]
             indent = len(original_line) - len(original_line.lstrip())
             self.epilogue_indents[buf] = indent
-            
+
             kernel_src.insert(loc - 1, placeholder)
 
         modified_src = '\n'.join(kernel_src)
@@ -6529,7 +6533,7 @@ class PartialTritonKernel(TritonKernel):
         print(self.render.code)
 
     def codegen_epilogue(self):
-        
+
         with self:
 
             for buf, varname in self.triton_binding.buf_to_varname.items():
@@ -6551,12 +6555,12 @@ class PartialTritonKernel(TritonKernel):
         self.render.finalize_all() # TODO[JJV]: We will move this away when introducing prologues.
         self.src_code = self.render.code
         print(self.render.code)
-    
+
     def store(self, name: str, index: sympy.Expr, value: CSEVariable, mode=None):
         """
         Typically we would want to use `DeferredLine` to remove intermediary stores.
-        In this case 
-        """        
+        In this case
+        """
         if name in self.triton_binding.store_varnames:
             input_var = self.triton_binding.store_varnames[name]
             self.compute.writeline(f"{input_var} = {value.name}")

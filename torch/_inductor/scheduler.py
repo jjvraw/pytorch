@@ -1444,86 +1444,23 @@ class FusableUserDefinedKernelSchedulerNode(BaseSchedulerNode):
         super().__init__(scheduler)
         self._init_from_node(node)
         self._compute_attrs()
-        self._body = self._create_dummy_body()
-
-    def _create_dummy_body(self):
-        class DummyBody:
-            op_counts = {
-                "mul": 2,  # x * 1.702, x * sigmoid_val
-                "exp": 1,  # exp(-sigmoid_input)
-                "add": 1,  # 1.0 + exp(...)
-                "div": 1,  # 1.0 / (...)
-            }
-
-            def get_reduction_type(self):
-                return None
-
-            def get_reduction_size(self):
-                return []
-
-        return DummyBody()
 
     def _compute_attrs(self) -> None:
         assert isinstance(self.node, ir.FusableUserDefinedTritonKernel)
 
-        # Get non-canonicalised sizes
-        mutated_buf = self.node.mutable_args[0]  # type: ignore
-        layout = mutated_buf.get_layout()
-        self._sizes = (tuple(layout.size), ())
+        iteration_vars = sorted(self.node.sym_to_val.keys(), key=lambda s: s.name)
+        iteration_sizes = tuple(self.node.sym_to_val[v] for v in iteration_vars)
+        self._sizes = (iteration_sizes, ())  # TODO[JJV]: Pointwise for now
 
-        device = self.node.get_device_or_error()  # type: ignore
+        device = self.node.get_device_or_error()
         group_fn = self.scheduler.get_backend(device).group_fn
         self.group = (device, group_fn(self._sizes))
 
-        read_writes = self.node.get_read_writes()  # type: ignore
-
+        read_writes = self.node.get_read_writes()
         self.set_read_writes(read_writes)
 
     def get_ranges(self) -> Sequence[Sequence[sympy.Expr]]:
         return self._sizes
-
-    def pointwise_or_reduction_read_writes(
-        self, pointwise: bool = True
-    ) -> dependencies.ReadWrites:
-        # TODO:
-        keep_sizes, ignore_sizes = self._sizes if pointwise else reversed(self._sizes)
-
-        # For user-defined kernels, we don't have a symbolic body to analyze,
-        # so we manually construct the ReadWrites with range_vars
-        full_rw = self.node.get_read_writes()  # type: ignore
-
-        # Create range variables for the dimensions we're keeping
-        range_vars = [
-            sympy.Symbol(f"d{i}", integer=True) for i in range(len(keep_sizes))
-        ]
-
-        # Return ReadWrites with the range_vars attribute
-        return dependencies.ReadWrites(
-            reads=full_rw.reads,
-            writes=full_rw.writes,
-            index_exprs=full_rw.index_exprs
-            if hasattr(full_rw, "index_exprs")
-            else OrderedSet(),
-            range_vars=range_vars,
-            var_ranges={var: size for var, size in zip(range_vars, keep_sizes)},
-        )
-
-    def is_extern(self):
-        # TODO: Currently we'll mark keep this as False until we see problems.
-        # (since we still rely a lot of ExternKernel functionality)
-        return super().is_extern()
-
-    def add_fake_dep(self, dep: Dep) -> None:
-        return
-        # if isinstance(dep, StarDep):
-        #     has_memory_dep = any(
-        #         isinstance(d, MemoryDep) and d.name == dep.name
-        #         for d in self.read_writes.reads
-        #     )
-        #     if has_memory_dep:
-        #         return
-        #
-        # super().add_fake_dep(dep)
 
     def is_fusable_user_triton(self) -> bool:
         return True

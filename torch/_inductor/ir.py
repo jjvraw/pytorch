@@ -7232,6 +7232,7 @@ class FusableUserDefinedTritonKernel(UserDefinedTritonKernel):
         )
 
         self.sym_meta = analysis.sym_meta
+        self.sym_to_val = analysis.sym_to_val
         self._extract_read_write_patterns(
             analysis.reads, analysis.writes, analysis.sym_to_val
         )
