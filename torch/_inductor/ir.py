@@ -7780,17 +7780,19 @@ class UserDefinedTritonKernel(ExternKernel):
         return self._codegen(wrapper, epilogue_fusion=None)
 
     def codegen_with_epilogue_fusion(
-        self, wrapper: PythonWrapperCodegen, epilogue_fusion: tuple[ComputedBuffer, str]
+        self,
+        wrapper: PythonWrapperCodegen,
+        epilogue_fusion: tuple[ComputedBuffer, str, list[tuple[str, str]]],
     ) -> None:
         """
-        epilogue_fusion: (fused epilogue node, modified kerel src code)
+        epilogue_fusion: (fused epilogue node, modified kernel src code, additional buf args)
         """
         return self._codegen(wrapper, epilogue_fusion)
 
     def _codegen(
         self,
         wrapper: PythonWrapperCodegen,
-        epilogue_fusion: tuple[ComputedBuffer, str] | None,
+        epilogue_fusion: tuple[ComputedBuffer, str, list[tuple[str, str]]] | None,
     ) -> None:
         """Overrides the parent member.
         See https://github.com/pytorch/pytorch/issues/151692"""
@@ -7804,7 +7806,24 @@ class UserDefinedTritonKernel(ExternKernel):
             reset_to_zero_args,
         ) = self.get_kernel_and_metadata()
 
-        # Definition of kernel
+        # When fusing an epilogue, the mutable arg is replaced by the epilogue's
+        # output buffer (which may have a different dtype). Compute all epilogue
+        # overrides upfront so both the kernel definition (signature) and the
+        # call site see the correct buffer.
+        kernel_kwargs = self.kwargs
+        epilogue_pre_args: dict[str, Any] = {}
+        epilogue_out_override: dict[str, Any] = {}
+        if epilogue_fusion:
+            assert len(self.formal_accesses.read_writes.writes) == 1
+            mutable_arg_name = next(iter(self.formal_accesses.read_writes.writes)).name
+            epilogue_computed_buffer, _, additional_args = epilogue_fusion
+            kernel_kwargs = {**self.kwargs, mutable_arg_name: epilogue_computed_buffer}
+            epilogue_pre_args = {
+                param_name: V.graph.get_buffer(buf_name)
+                for param_name, buf_name in additional_args
+            }
+            epilogue_out_override = {mutable_arg_name: epilogue_computed_buffer}
+
         (
             new_name,
             triton_meta,
@@ -7813,7 +7832,7 @@ class UserDefinedTritonKernel(ExternKernel):
         ) = wrapper.define_user_defined_triton_kernel(
             kernel,
             configs,
-            self.kwargs,
+            kernel_kwargs,
             restore_value_args,
             reset_to_zero_args,
             self.grid,
@@ -7822,13 +7841,8 @@ class UserDefinedTritonKernel(ExternKernel):
         named_args = {
             k: self.get_kwargs_value(k) for k in self.ordered_kwargs_for_cpp_kernel
         }
-
-        if epilogue_fusion:
-            assert len(self.formal_accesses.read_writes.writes) == 1
-            mutable_arg_name = next(iter(self.formal_accesses.read_writes.writes)).name
-            assert mutable_arg_name in named_args
-            epilogue_computed_buffer, _ = epilogue_fusion
-            named_args[mutable_arg_name] = epilogue_computed_buffer
+        named_args.update(epilogue_out_override)
+        named_args = {**epilogue_pre_args, **named_args}
 
         arg_names = [p.name for p in kernel.params]  # type: ignore[attr-defined]
         constexprs = [p.num for p in kernel.params if p.is_constexpr]  # type: ignore[attr-defined]
@@ -7910,6 +7924,8 @@ class UserDefinedTritonKernel(ExternKernel):
         grid: Any,
         tma_descriptor_metadata: dict[str, Any],
         kernel_args: dict[str, Any],
+        output_tile: tuple[str, ...] | None = None,
+        pid_remap: tuple[str, ...] | None = None,
     ) -> None:
         inputs: list[IRNode] = []
         kwargs: dict[str, IRNode] = {}
@@ -7939,6 +7955,8 @@ class UserDefinedTritonKernel(ExternKernel):
         )
         self.kernel_idx = kernel_idx
         self.grid = grid
+        self.output_tile = output_tile
+        self.pid_remap = pid_remap
 
         kernel, configs, _, _ = self.get_kernel_and_metadata()
 
@@ -7974,6 +7992,14 @@ class UserDefinedTritonKernel(ExternKernel):
             MutationOutput(NoneLayout(device=self.device), buf, self)
             for buf in self.mutable_args
         ]
+
+        if output_tile is not None:
+            for name in output_tile:
+                if name not in kernel_args:
+                    raise ValueError(
+                        f"output_tile name '{name}' is not a kernel argument. "
+                        f"Available arguments: {list(kernel_args.keys())}"
+                    )
         V.graph.register_operation(self)
 
     @override

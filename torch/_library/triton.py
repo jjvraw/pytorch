@@ -501,7 +501,12 @@ def capture_triton(triton_kernel: Callable, /) -> Any:
 
 
 @exposed_in("torch.library")
-def wrap_triton(triton_kernel: Callable, /) -> Any:
+def wrap_triton(
+    triton_kernel: Callable,
+    /,
+    output_tile: tuple[str, ...] | None = None,
+    pid_remap: tuple[str, ...] | None = None,
+) -> Any:
     """Allows capture of a triton kernel into a graph via make_fx or
     non-strict ``torch.export``.
 
@@ -572,6 +577,29 @@ def wrap_triton(triton_kernel: Callable, /) -> Any:
         raise RuntimeError(
             "wrap_triton only works on functions annotated with triton.jit or triton.autotune"
         )
+    if output_tile is not None:
+        if not isinstance(output_tile, tuple) or not all(
+            isinstance(s, str) for s in output_tile
+        ):
+            raise TypeError(
+                f"output_tile must be a tuple of strings, got {output_tile!r}"
+            )
+        if len(output_tile) == 0:
+            raise ValueError("output_tile must be non-empty")
+    if pid_remap is not None:
+        if output_tile is None:
+            raise ValueError("pid_remap requires output_tile to also be specified")
+        if not isinstance(pid_remap, tuple) or not all(
+            isinstance(s, str) for s in pid_remap
+        ):
+            raise TypeError(f"pid_remap must be a tuple of strings, got {pid_remap!r}")
+        if len(pid_remap) != len(output_tile):
+            raise ValueError(
+                f"pid_remap length ({len(pid_remap)}) must match "
+                f"output_tile length ({len(output_tile)})"
+            )
     if not is_wrap_triton_enabled():
         return triton_kernel
-    return TraceableTritonKernelWrapper(triton_kernel, None, None)
+    return TraceableTritonKernelWrapper(
+        triton_kernel, None, None, output_tile=output_tile, pid_remap=pid_remap
+    )
